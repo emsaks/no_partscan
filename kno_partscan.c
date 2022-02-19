@@ -24,12 +24,49 @@ static char func_name[NAME_MAX] = "add_disk";
 static char func_name[NAME_MAX] = "device_add_disk";
 #endif
 
-static int enabled = 1;
-module_param(enabled, int, 0664);
+static bool enabled = 1;
+module_param(enabled, bool, 0664);
+static bool block_all = 0;
+module_param(block_all, bool, 0664);
+static bool block_once = 0;
+module_param(block_once, bool, 0664);
+
+static char * blocklist[20];
+static int nr_blocklist;
+module_param_array(blocklist, charp, &nr_blocklist, 0664);
 
 struct instance_data {
     struct gendisk *disk;
 };
+
+static int is_blocklisted(struct pt_regs *regs, struct gendisk * disk)
+{
+    char *devpath;
+    struct kobject * parent;
+    int idx;
+    int len;
+
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,7,10)
+    parent = (struct kobject *)(disk->driverfs_dev);
+#else
+    parent = (struct kobject *)(regs->ARG1);
+#endif
+
+    if (!parent) return 0;
+
+    devpath = kobject_get_path(parent, GFP_KERNEL);
+    len = strlen(devpath);
+    for (idx = 0; idx < nr_blocklist; ++idx) {
+        if (!strncmp(devpath, blocklist[idx], len)) {
+            // ignore trailing newlines
+            if (blocklist[idx][len] != '\0' && blocklist[idx][len] != '\n') continue;
+            kfree(devpath);
+            return 1;
+        }
+    }
+    kfree(devpath);
+    return 0;
+}
 
 static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
@@ -39,9 +76,10 @@ static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
     data = (struct instance_data *)ri->data;
     disk = (struct gendisk *)(regs->ARG);
 
-    if (!enabled || disk->flags & GENHD_FL_NO_PART_SCAN) {
+    if (!enabled || disk->flags & GENHD_FL_NO_PART_SCAN || !(block_all || block_once || is_blocklisted(regs, disk))) {
         data->disk = NULL;
     } else {
+        block_once = 0;
         pr_warn("Intercepted partition read for disk: %s.\n", disk->disk_name);
         disk->flags |= (GENHD_FL_NO_PART_SCAN);
         data->disk = disk; // store this so we can remove the NO_PARTSCAN flag on function return
