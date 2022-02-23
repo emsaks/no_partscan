@@ -26,44 +26,133 @@ static char func_name[NAME_MAX] = "device_add_disk";
 
 static bool enabled = 1;
 module_param(enabled, bool, 0664);
+
 static bool block_all = 0;
 module_param(block_all, bool, 0664);
+
 static bool block_once = 0;
 module_param(block_once, bool, 0664);
 
-static char * blocklist[20];
-static int nr_blocklist;
-module_param_array(blocklist, charp, &nr_blocklist, 0664);
+#define MAX_PATHS 20
+
+static char blocklist[MAX_PATHS][PATH_MAX];
+static int nr_blocklist = 0;
+static char blocklist_once[MAX_PATHS][PATH_MAX];
+static int nr_blocklist_once = 0;
+
+static int index_of(const char * path, char list[][PATH_MAX], int * count, int exact)
+{
+    int i, len;
+
+    if (exact) {
+        for (i=0; i<*count; ++i)
+            if (!strncmp(list[i], path, PATH_MAX)) return i;
+    } else for (i=0; i<*count; ++i) {
+        len = strlen(list[i]);
+        if (list[i][len-1] == '/') --len;
+        if (!strncmp(list[i], path, len) && (list[i][len] == path[len] || path[len] == '\0')) return i;
+    }
+
+    return -1;
+}
+
+// We use !exact when looking up a path to block - then we want to forget *any* matching path
+static int forget_path(const char * path, char list[][PATH_MAX], int * count, int exact)
+{
+    int i;
+
+    i = index_of(path, list, count, exact);
+    if (i < 0) return -ENOENT;
+
+    do {
+        (*count)--;
+        memcpy(list[i], list[i+1], (*count - i) * PATH_MAX);
+        // if not exact, loop until no more matches
+        i = exact ? -1 : index_of(path, list, count, exact);
+    } while (i >= 0);
+
+    return 0;
+}
+
+static int add_path(const char * path, char list[][PATH_MAX], int * count)
+{
+    if (index_of(path, list, count, 1) >= 0) return 0;
+    if (*count == MAX_PATHS) return -ENOMEM;
+    strncpy(list[(*count)++], path, PATH_MAX);
+    return 0;
+}
+
+static char * normalize_path(char * path) // allow paths retrieved from sysfs
+{
+    char * bptr;
+    int len;
+
+    bptr = strstr(path, "/block");
+    if (bptr)
+        bptr[0] = '\0';
+    else { // wildcard
+        len = strlen(path);
+        path[len++] = '/';
+        path[len] = '\0';
+    }
+    if (!strncmp(path, "/sys/", 5)) return path + 4;
+    if (path[0] == '.' && path[1] == '/') path += 1;
+    if (path[0] == '.' && path[1] == '.' && path[2] == '/') path += 2;
+    while (!strncmp(path, "/../", 4)) path += 3;
+
+    return path;
+}
+
+char _path[PATH_MAX];
+static int set_path(const char * val, const struct kernel_param *kp)
+{
+    char * path;
+
+    strcpy(_path, val);
+    path = normalize_path(_path);
+
+    if (kp->arg == NULL) {
+        return forget_path(path, blocklist_once, &nr_blocklist_once, 1) & forget_path(path, blocklist, &nr_blocklist, 1);
+    } else if (kp->arg == blocklist_once) {
+        return add_path(val, blocklist_once, &nr_blocklist_once);
+    } else if (kp->arg == blocklist) {
+        return add_path(path, blocklist, &nr_blocklist);
+    }
+
+    return -EBADMSG;
+}
+
+struct kernel_param_ops path_ops = { 0, set_path, NULL, NULL};
+
+module_param_cb(block_path, &path_ops, &blocklist, 0220);
+module_param_cb(block_path_once, &path_ops, &blocklist_once, 0220);
+module_param_cb(forget_path, &path_ops, NULL, 0220);
 
 struct instance_data {
     struct gendisk *disk;
 };
 
-static int is_blocklisted(struct pt_regs *regs, struct gendisk * disk)
+// Will remove the path from blocklist_once
+static int is_blocklisted(struct pt_regs *regs, struct gendisk * disk) // todo: allow removal from list (i.e. _once)
 {
     char *devpath;
     struct kobject * parent;
-    int idx;
-    int len;
 
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(4,7,10)
     parent = (struct kobject *)(disk->driverfs_dev);
-#else
+#else // driverfs_dev removed and device passed directly to the function
     parent = (struct kobject *)(regs->ARG1);
 #endif
-
     if (!parent) return 0;
 
     devpath = kobject_get_path(parent, GFP_KERNEL);
-    len = strlen(devpath);
-    for (idx = 0; idx < nr_blocklist; ++idx) {
-        if (!strncmp(devpath, blocklist[idx], len)) {
-            // ignore trailing newlines
-            if (blocklist[idx][len] != '\0' && blocklist[idx][len] != '\n') continue;
-            kfree(devpath);
-            return 1;
-        }
+    if (!devpath) return 0;
+
+    if (!forget_path(devpath, blocklist_once, &nr_blocklist_once, 0) || index_of(devpath, blocklist, &nr_blocklist, 0) >= 0) {
+        kfree(devpath);
+        return 1;
     }
+
     kfree(devpath);
     return 0;
 }
@@ -76,10 +165,11 @@ static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
     data = (struct instance_data *)ri->data;
     disk = (struct gendisk *)(regs->ARG);
 
-    if (!enabled || disk->flags & GENHD_FL_NO_PART_SCAN || !(block_all || block_once || is_blocklisted(regs, disk))) {
+    if (!enabled
+        || (!is_blocklisted(regs, disk) && !block_all && !block_once)
+        || (block_once = 0, disk->flags & GENHD_FL_NO_PART_SCAN)) {
         data->disk = NULL;
     } else {
-        block_once = 0;
         pr_warn("Intercepted partition read for disk: %s.\n", disk->disk_name);
         disk->flags |= (GENHD_FL_NO_PART_SCAN);
         data->disk = disk; // store this so we can remove the NO_PARTSCAN flag on function return
