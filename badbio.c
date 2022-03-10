@@ -58,15 +58,18 @@ int register_probe(char * name)
 static int __init kretprobe_init(void)
 {
     int ret;
-    if ((ret = register_probe("blkdev_bio_end_io"))) return ret;
-    //if ((ret = register_probe("blkdev_bio_end_io_simple"))) return ret;
-    //if ((ret = register_probe("blkdev_bio_end_io_async"))) return ret;
+    if ((ret = register_probe("blkdev_bio_end_io"))) goto err;
+    if ((ret = register_probe("blkdev_bio_end_io_simple"))) goto err;
+    if ((ret = register_probe("blkdev_bio_end_io_async"))) goto err;
     return 0;
+err:
+	while (--nr_probes >= 0) unregister_kretprobe(&probes[nr_probes]);
+	return ret;
 }
 
 static void __exit kretprobe_exit(void)
 {
-    while (--nr_probes > 0) unregister_kretprobe(&probes[nr_probes]);
+    while (--nr_probes >= 0) unregister_kretprobe(&probes[nr_probes]);
 }
 
 module_init(kretprobe_init)
