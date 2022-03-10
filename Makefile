@@ -5,3 +5,7 @@ default:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
+bio:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	if [ -e /sys/module/badbio ]; then rmmod badbio.ko; fi
+	insmod badbio.ko
