@@ -1,4 +1,4 @@
-obj-m := no_partscan.o badbio.o
+obj-m := no_partscan.o badbio.o biosnoop.o
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 default:

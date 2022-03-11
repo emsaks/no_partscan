@@ -1,6 +1,9 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/kprobes.h>
+#include <linux/bio.h>
+#include <linux/genhd.h>
+#include <linux/blkdev.h>
 
 #include "regs.h"
 
@@ -23,6 +26,7 @@ module_param(match_bios, bool, 0664);
 static struct kprobe submit_probe = { .symbol_name = "submit_bio", .pre_handler = submit_pre };
 static struct kprobe probes[MAX_PROBES];
 static int nr_probes = 0;
+DEFINE_MUTEX(probe_mutex);
 
 struct bio_info {
 	struct bio * bio;
@@ -51,33 +55,47 @@ struct bio_info * find_bio(struct bio * bio)
 
 static int __kprobes submit_pre(struct kprobe *p, struct pt_regs *regs)
 {
-	int ret;
+	int ret, i, _nr_probes;
 	struct  bio * bio;
 
 	if (!enabled) return 0;
 
 	bio = (struct bio*)regs->ARG1;
 
-	if (show_submit) {
-		// todo
-	}
+	_nr_probes = READ_ONCE(nr_probes);
+	for (i = 0; i < _nr_probes; ++i)
+		if (probes[i].addr == (void *)bio->bi_end_io) break;
 
-	// take lock
-	for (i = 0; i < nr_probes; ++i)
-		if (probes[i].addr == bio->bi_endio) break;
-	
-	if (i >= nr_probes) {
-		if (i == MAX_PROBES) {
-			// notify
-			goto err;
+	if (i >= _nr_probes) {
+		// if probe is not found, we need to take
+		// a lock and check if it has been added in the meantime
+		if (mutex_lock_interruptible(&probe_mutex) != 0) {
+			//notify
+			goto out;
 		}
-		probes[nr_probes].addr = bio->bi_endio;
-		ret = register_kprobe(&probes[nr_probes]);
-		if (ret < 0) {
+		READ_ONCE(nr_probes); // todo: do we need this inside the lock?
+		for (; i < nr_probes; ++i)
+			if (probes[i].addr == (void *)bio->bi_end_io) break;
+		if (i >= nr_probes) {
+			mutex_unlock(&probe_mutex);
+		} else if (i >= MAX_PROBES) {
+			mutex_unlock(&probe_mutex);
 			// notify
-			goto err;
+			goto out;
+		} else {
+			probes[nr_probes].addr = (void *)bio->bi_end_io;
+			probes[nr_probes].pre_handler = end_io_pre;
+			ret = register_kprobe(&probes[nr_probes]);
+			if (ret >= 0) {
+				nr_probes++;
+				mutex_unlock(&probe_mutex);
+				// notify plant
+			} else {
+				mutex_unlock(&probe_mutex);
+				// notify
+				goto out;
+			}
 		}
-		nr_probes++;
 	}
 
 	if (match_bios) {
@@ -87,8 +105,12 @@ static int __kprobes submit_pre(struct kprobe *p, struct pt_regs *regs)
 		bio_idx++;
 	}
 
-err:
-	// release lock
+out:
+	if (show_submit) {
+		// todo
+		// we can get endio info from probes[i]
+	}
+
 	return 0;
 }
 
@@ -119,12 +141,13 @@ static int __init kprobe_init(void)
 {
 	int ret;
 
+	mutex_init(&probe_mutex);
 	ret = register_kprobe(&submit_probe);
 	if (ret < 0) {
 		pr_err("register_kprobe failed for submit_bio, returned %d\n", ret);
 		return ret;
 	}
-	
+
 	return 0;
 }
 
