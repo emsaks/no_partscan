@@ -26,8 +26,7 @@ struct bio_info {
 	unsigned int size;
 };
 
-
-// we use a ring buffer and might overwrite a few
+// we use a ring buffer and might overwrite a few entries...
 #define MAX_BIOS 1000
 struct bio_info bios[MAX_BIOS];
 int bio_idx = 0;
@@ -38,9 +37,9 @@ struct bio_info * find_bio(struct bio * bio)
 
 	// we need check backwards from bio_idx to ensure that
 	// the most recent reference is found, not a stale one
-	for (i = bio_idx - 1; i > 0; --i)
+	for (i = bio_idx - 1; i >= 0; --i)
 		if (bios[i].bio == bio) return &bios[i];
-	for (i = bio_idx; i < MAX_BIOS; ++i)
+	for (i = MAX_BIOS - 1; i >= bio_idx; --i)
 		if (bios[i].bio == bio) return &bios[i];
 
 	return NULL;
