@@ -1,3 +1,4 @@
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/kprobes.h>
@@ -21,6 +22,9 @@ module_param(show_submit, bool, 0664);
 
 static bool match_bios = 1;
 module_param(match_bios, bool, 0664);
+
+static int missed_bios = 0;
+module_param(missed_bios, int, 0444);
 
 #define MAX_PROBES 200
 static struct kprobe submit_probe = { .symbol_name = "submit_bio", .pre_handler = submit_pre };
@@ -67,20 +71,24 @@ static int __kprobes submit_pre(struct kprobe *p, struct pt_regs *regs)
 		if (probes[i].addr == (void *)bio->bi_end_io) break;
 
 	if (i >= _nr_probes) {
+		if (nr_probes >= MAX_PROBES) {
+			if (!missed_bios++) pr_warn("Can't allocate a new probe.\n");
+			goto out;
+		}
 		// if probe is not found, we need to take
 		// a lock and check if it has been added in the meantime
 		if (mutex_lock_interruptible(&probe_mutex) != 0) {
-			//notify
+			pr_warn("Interrupted when taking lock.\n");
 			goto out;
 		}
 		READ_ONCE(nr_probes); // todo: do we need this inside the lock?
 		for (; i < nr_probes; ++i)
 			if (probes[i].addr == (void *)bio->bi_end_io) break;
-		if (i >= nr_probes) {
+		if (i < nr_probes) {
 			mutex_unlock(&probe_mutex);
 		} else if (i >= MAX_PROBES) {
 			mutex_unlock(&probe_mutex);
-			// notify
+			if (!missed_bios++) pr_warn("Can't allocate a new probe.\n");
 			goto out;
 		} else {
 			probes[nr_probes].addr = (void *)bio->bi_end_io;
@@ -89,10 +97,10 @@ static int __kprobes submit_pre(struct kprobe *p, struct pt_regs *regs)
 			if (ret >= 0) {
 				nr_probes++;
 				mutex_unlock(&probe_mutex);
-				// notify plant
+				pr_info("Planted probe.\n");
 			} else {
 				mutex_unlock(&probe_mutex);
-				// notify
+				pr_warn("Failed to plant probe.\n");
 				goto out;
 			}
 		}
@@ -147,6 +155,7 @@ static int __init kprobe_init(void)
 		pr_err("register_kprobe failed for submit_bio, returned %d\n", ret);
 		return ret;
 	}
+	pr_info("Planted kprobe at %p\n", submit_probe.addr);
 
 	return 0;
 }
