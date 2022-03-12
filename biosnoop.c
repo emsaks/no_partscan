@@ -162,9 +162,9 @@ static int __kprobes end_io_pre(struct kprobe *p, struct pt_regs *regs)
 	}
 	if (err || show_success) {
 		if (size) 
-			pr_warn("%s (%s) > %s (%i); @%llu: +%u/%u (-%u) bytes.\n", current->comm, p->symbol_name, bio->bi_bdev ? bio->bi_bdev->bd_disk->disk_name : "(null)", err, bio->bi_iter.bi_sector, bio->bi_iter.bi_bvec_done, bio->bi_iter.bi_size, size);
+			pr_warn("%s (%s) -> %s (%i); @%llu: +%u/%u (-%u) bytes.\n", current->comm, p->symbol_name, bio->bi_bdev ? bio->bi_bdev->bd_disk->disk_name : "(null)", err, bio->bi_iter.bi_sector, bio->bi_iter.bi_bvec_done, bio->bi_iter.bi_size, size);
 		else
-			pr_warn("%s (%s) > %s (%i); @%llu: +%u (-%u) bytes.\n", current->comm, p->symbol_name, bio->bi_bdev ? bio->bi_bdev->bd_disk->disk_name : "(null)", err, bio->bi_iter.bi_sector, bio->bi_iter.bi_bvec_done, bio->bi_iter.bi_size);
+			pr_warn("%s (%s) -> %s (%i); @%llu: +%u (-%u) bytes.\n", current->comm, p->symbol_name, bio->bi_bdev ? bio->bi_bdev->bd_disk->disk_name : "(null)", err, bio->bi_iter.bi_sector, bio->bi_iter.bi_bvec_done, bio->bi_iter.bi_size);
 	}
     return 0;
 }
