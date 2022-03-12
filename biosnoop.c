@@ -157,9 +157,9 @@ static int __kprobes end_io_pre(struct kprobe *p, struct pt_regs *regs)
 	if (!enabled) return 0;
 	bio = (struct bio*)regs->ARG1;
 	err = blk_status_to_errno(bio->bi_status);
-	ifo = match_bios ? find_bio(bio) : NULL;
 
 	if (err || show_success) {
+		ifo = match_bios ? find_bio(bio) : NULL;
 		if (ifo) 
 			pr_warn("%s (%s) -> %s (%i); @%llu: +%u/%u (-%u) bytes.\n", current->comm, p->symbol_name, bio->bi_bdev ? bio->bi_bdev->bd_disk->disk_name : "(null)", err, ifo->sector, bio->bi_iter.bi_bvec_done, bio->bi_iter.bi_size, ifo->size);
 		else
