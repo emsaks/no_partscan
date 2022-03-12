@@ -6,6 +6,21 @@
 #include <linux/genhd.h>
 #include <linux/blkdev.h>
 
+/*
+	This module uses probes on each unique end_io function
+	encountered.
+	A better options would be to replace the end_io with a
+	custom function, and restore the original+private_data
+	when called. This avoids a lookup on end_io because we
+	could store the information in private_data.
+	It would also avoid planting probes, and would further
+	allow a non-locking list of cached data.
+	However, I don't know if any kernel code performs some
+	chicanary with private_data (i.e. relies on inspecting
+	private_data when a bio is submitted) so it may not be
+	safe to play with it.
+*/
+
 #include "regs.h"
 
 static int __kprobes submit_pre(struct kprobe *p, struct pt_regs *regs);
@@ -59,6 +74,8 @@ struct bio_info * find_bio(struct bio * bio)
 
 static int __kprobes submit_pre(struct kprobe *p, struct pt_regs *regs)
 {
+	static char sym_buf[KSYM_SYMBOL_LEN];
+	char * sym_ptr;
 	int ret, i, _nr_probes;
 	struct  bio * bio;
 
@@ -97,10 +114,17 @@ static int __kprobes submit_pre(struct kprobe *p, struct pt_regs *regs)
 			if (ret >= 0) {
 				nr_probes++;
 				mutex_unlock(&probe_mutex);
-				pr_info("Planted probe.\n");
+				if (sprint_symbol(sym_buf, (unsigned long)bio->bi_end_io)) {
+					if ((sym_ptr = kzalloc(KSYM_SYMBOL_LEN, GFP_KERNEL))) {
+						strcpy(sym_ptr, sym_buf);
+						probes[nr_probes-1].symbol_name = sym_ptr;
+					}
+					pr_info("Planted probe at %s.\n", sym_buf);
+				} else pr_info("Planted probe at address %p.\n", bio->bi_end_io);
 			} else {
 				mutex_unlock(&probe_mutex);
-				pr_warn("Failed to plant probe.\n");
+				if (sprint_symbol(sym_buf, (unsigned long)bio->bi_end_io)) pr_info("Failed to plant probe at %s.\n", sym_buf);
+				else pr_warn("Failed to plant probe at address %p.\n", bio->bi_end_io);
 				goto out;
 			}
 		}
@@ -124,6 +148,7 @@ out:
 
 static int __kprobes end_io_pre(struct kprobe *p, struct pt_regs *regs)
 {
+	// todo: utilize end_io name that may be in p->symbol_name
 	struct bio *bio;
 	struct bio_info * ifo;
 	int err;
@@ -138,9 +163,9 @@ static int __kprobes end_io_pre(struct kprobe *p, struct pt_regs *regs)
 	}
 	if (err || show_success) {
 		if (size) 
-			pr_warn("%s> %s (%i); @%llu: -%u, +%u/%u bytes.\n", current->comm, bio->bi_bdev ? bio->bi_bdev->bd_disk->disk_name : "(null)", err, bio->bi_iter.bi_sector, bio->bi_iter.bi_size, bio->bi_iter.bi_bvec_done, size);
+			pr_warn("%s (%s) > %s (%i); @%llu: +%u/%u (-%u) bytes.\n", current->comm, p->symbol_name, bio->bi_bdev ? bio->bi_bdev->bd_disk->disk_name : "(null)", err, bio->bi_iter.bi_sector, bio->bi_iter.bi_bvec_done, bio->bi_iter.bi_size, size);
 		else
-			pr_warn("%s> %s (%i); @%llu: -%u, +%u bytes.\n", current->comm, bio->bi_bdev ? bio->bi_bdev->bd_disk->disk_name : "(null)", err, bio->bi_iter.bi_sector, bio->bi_iter.bi_size, bio->bi_iter.bi_bvec_done);
+			pr_warn("%s (%s) > %s (%i); @%llu: +%u (-%u) bytes.\n", current->comm, p->symbol_name, bio->bi_bdev ? bio->bi_bdev->bd_disk->disk_name : "(null)", err, bio->bi_iter.bi_sector, bio->bi_iter.bi_bvec_done, bio->bi_iter.bi_size);
 	}
     return 0;
 }
@@ -155,18 +180,19 @@ static int __init kprobe_init(void)
 		pr_err("register_kprobe failed for submit_bio, returned %d\n", ret);
 		return ret;
 	}
-	pr_info("Planted kprobe at %p\n", submit_probe.addr);
+	pr_info("Planted probe for submit_bio at %p\n", submit_probe.addr);
 
 	return 0;
 }
 
 static void __exit kprobe_exit(void)
 {
-	int i;
-
 	unregister_kprobe(&submit_probe);
-	for (i = 0; i < nr_probes; ++i)
-		unregister_kprobe(&probes[i]);
+	while (--nr_probes >= 0)
+		// we may have allocated a string when planting the probe
+		kfree(probes[nr_probes].symbol_name);
+		unregister_kprobe(&probes[nr_probes]);
+	}
 }
 
 module_init(kprobe_init)
