@@ -50,6 +50,7 @@ DEFINE_MUTEX(probe_mutex);
 struct bio_info {
 	struct bio * bio;
 	unsigned int size;
+	unsigned long long sector;
 };
 
 // we use a ring buffer and might overwrite a few entries...
@@ -134,6 +135,7 @@ static int __kprobes submit_pre(struct kprobe *p, struct pt_regs *regs)
 		if (bio_idx >= MAX_BIOS) bio_idx = 0;
 		bios[bio_idx].bio = bio;
 		bios[bio_idx].size = bio->bi_iter.bi_size;
+		bios[bio_idx].sector = bio->bi_iter.bi_sector;
 		bio_idx++;
 	}
 
@@ -149,7 +151,7 @@ out:
 static int __kprobes end_io_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	struct bio *bio;
-	struct bio_info * ifo;
+	struct bio_info * ifo = NULL;
 	int err;
 	unsigned int size = 0; // fixme: use ~0 as flag
 
@@ -161,8 +163,8 @@ static int __kprobes end_io_pre(struct kprobe *p, struct pt_regs *regs)
 			size = ifo->size;
 	}
 	if (err || show_success) {
-		if (size) 
-			pr_warn("%s (%s) -> %s (%i); @%llu: +%u/%u (-%u) bytes.\n", current->comm, p->symbol_name, bio->bi_bdev ? bio->bi_bdev->bd_disk->disk_name : "(null)", err, bio->bi_iter.bi_sector, bio->bi_iter.bi_bvec_done, bio->bi_iter.bi_size, size);
+		if (ifo) 
+			pr_warn("%s (%s) -> %s (%i); @%llu: +%u/%u (-%u) bytes.\n", current->comm, p->symbol_name, bio->bi_bdev ? bio->bi_bdev->bd_disk->disk_name : "(null)", err, ifo->sector, bio->bi_iter.bi_bvec_done, bio->bi_iter.bi_size, ifo->size);
 		else
 			pr_warn("%s (%s) -> %s (%i); @%llu: +%u (-%u) bytes.\n", current->comm, p->symbol_name, bio->bi_bdev ? bio->bi_bdev->bd_disk->disk_name : "(null)", err, bio->bi_iter.bi_sector, bio->bi_iter.bi_bvec_done, bio->bi_iter.bi_size);
 	}
