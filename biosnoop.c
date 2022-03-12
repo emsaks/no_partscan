@@ -98,7 +98,7 @@ static int __kprobes submit_pre(struct kprobe *p, struct pt_regs *regs)
 			pr_warn("Interrupted when taking lock.\n");
 			goto out;
 		}
-		READ_ONCE(nr_probes); // todo: do we need this inside the lock?
+		READ_ONCE(nr_probes); // todo: do we really need this inside the lock?
 		for (; i < nr_probes; ++i)
 			if (probes[i].addr == (void *)bio->bi_end_io) break;
 		if (i < nr_probes) {
@@ -148,7 +148,6 @@ out:
 
 static int __kprobes end_io_pre(struct kprobe *p, struct pt_regs *regs)
 {
-	// todo: utilize end_io name that may be in p->symbol_name
 	struct bio *bio;
 	struct bio_info * ifo;
 	int err;
@@ -188,7 +187,7 @@ static int __init kprobe_init(void)
 static void __exit kprobe_exit(void)
 {
 	unregister_kprobe(&submit_probe);
-	while (--nr_probes >= 0)
+	while (--nr_probes >= 0) {
 		// we may have allocated a string when planting the probe
 		kfree(probes[nr_probes].symbol_name);
 		unregister_kprobe(&probes[nr_probes]);
