@@ -153,15 +153,13 @@ static int __kprobes end_io_pre(struct kprobe *p, struct pt_regs *regs)
 	struct bio *bio;
 	struct bio_info * ifo = NULL;
 	int err;
-	unsigned int size = 0; // fixme: use ~0 as flag
 
 	if (!enabled) return 0;
 	bio = (struct bio*)regs->ARG1;
 	err = blk_status_to_errno(bio->bi_status);
-	if (match_bios) {
-		if((ifo = find_bio(bio)))
-			size = ifo->size;
-	}
+	if (match_bios)
+		ifo = find_bio(bio);
+
 	if (err || show_success) {
 		if (ifo) 
 			pr_warn("%s (%s) -> %s (%i); @%llu: +%u/%u (-%u) bytes.\n", current->comm, p->symbol_name, bio->bi_bdev ? bio->bi_bdev->bd_disk->disk_name : "(null)", err, ifo->sector, bio->bi_iter.bi_bvec_done, bio->bi_iter.bi_size, ifo->size);
