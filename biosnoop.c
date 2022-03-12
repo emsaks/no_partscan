@@ -151,14 +151,13 @@ out:
 static int __kprobes end_io_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	struct bio *bio;
-	struct bio_info * ifo = NULL;
+	struct bio_info * ifo;
 	int err;
 
 	if (!enabled) return 0;
 	bio = (struct bio*)regs->ARG1;
 	err = blk_status_to_errno(bio->bi_status);
-	if (match_bios)
-		ifo = find_bio(bio);
+	ifo = match_bios ? find_bio(bio) : NULL;
 
 	if (err || show_success) {
 		if (ifo) 
