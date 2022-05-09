@@ -4,6 +4,7 @@
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/genhd.h>
+#include <linux/slab.h>
 
 #include "regs.h"
 
