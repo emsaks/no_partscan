@@ -70,10 +70,13 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	devpath = kobject_get_path(&lc->dev->bdev->bd_device.kobj, GFP_KERNEL);
+
 	lc->match_len = strlen(argv[1]);
 	if (memcmp(devpath, argv[1], lc->match_len)) {
-		kfree(devpath);
+		pr_warn("persist: dev not on path");
 		ti->error = "Device is not on provided path";
+		kfree(devpath);
+		dm_put_device(ti, lc->dev);
 		goto bad;
 	}
 	kfree(devpath);
