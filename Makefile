@@ -1,5 +1,5 @@
-obj-m := no_partscan.o badbio.o biosnoop.o dm_persist2.o
-dm_persist2-objs := dm_persist.o
+obj-m := dm_persist.o #no_partscan.o badbio.o biosnoop.o dm_persist.o
+#dm_persist2-objs := dm_persist.o
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 default:

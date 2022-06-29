@@ -15,6 +15,7 @@
 #include <linux/slab.h>
 #include <linux/device-mapper.h>
 #include <linux/raid/md_p.h>
+#include <linux/version.h>
 
 /*
  * Copyright (C) 2001-2003 Sistina Software (UK) Limited.
@@ -44,6 +45,7 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	char dummy;
 	int ret;
 	char * devpath;
+	struct dm_dev * dev;
 
 	if (argc != 3) {
 		ti->error = "Invalid argument count";
@@ -63,24 +65,25 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 	lc->start = tmp;
 
-	ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &lc->dev);
+	ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &dev);
 	if (ret) {
 		ti->error = "Device lookup failed";
 		goto bad;
 	}
 
-	devpath = kobject_get_path(&lc->dev->bdev->bd_device.kobj, GFP_KERNEL);
+	devpath = kobject_get_path(&disk_to_dev(lc->dev->bdev->bd_disk)->kobj, GFP_KERNEL);
 
 	lc->match_len = strlen(argv[1]);
-	if (1) { //memcmp(devpath, argv[1], lc->match_len)) {
+	if (memcmp(devpath, argv[1], lc->match_len)) {
 		pr_warn("persist: Device is not on path: %s != %s\n", devpath, argv[1]);
 		ti->error = "Device is not on provided path";
 		kfree(devpath);
-		dm_put_device(ti, lc->dev);
+		dm_put_device(ti, dev);
 		goto bad;
 	}
 	kfree(devpath);
 
+	lc->dev = dev;
 	ti->num_flush_bios = 1;
 	ti->num_discard_bios = 1;
 	ti->num_secure_erase_bios = 1;
@@ -146,24 +149,29 @@ static void persist_status(struct dm_target *ti, status_type_t type,
 		DMEMIT("%s %llu", get_dev(lc)->name, (unsigned long long)lc->start);
 		break;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,15,0)
 	case STATUSTYPE_IMA:
 		DMEMIT_TARGET_NAME_VERSION(ti->type);
 		DMEMIT(",device_name=%s,start=%llu;", get_dev(lc)->name,
 		       (unsigned long long)lc->start);
 		break;
+#endif
 	}
 }
 
 static int persist_iterate_devices(struct dm_target *ti,
 				  iterate_devices_callout_fn fn, void *data)
 {
-	if (!ti) pr_warn("no ti\n");
-	if (!ti->private) pr_warn("no private\n");
-	if (!data) pr_warn("no data\n");
 	struct persist_c *lc = ti->private;
 
 	return fn(ti, get_dev(lc), lc->start, ti->len, data);
 }
+#ifndef DM_TARGET_PASSES_CRYPTO
+	#define DM_TARGET_PASSES_CRYPTO 0
+#endif
+#ifndef DM_TARGET_NOWAIT
+	#define DM_TARGET_NOWAIT 0
+#endif
 
 static struct target_type persist_target = {
 	.name   = "persist2",
