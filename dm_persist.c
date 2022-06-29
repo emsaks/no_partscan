@@ -116,6 +116,8 @@ static struct dm_dev * get_dev(struct persist_c *lc)
 		// check toggle value: return old disk, can we just put the old disk and quit somehow?
 	//}
 	//pr_warn("dev flags: %i, state: %lu\n", lc->dev->bdev->bd_disk->flags, lc->dev->bdev->bd_disk->state);
+	if (!lc) pr_warn ("no lc\n");
+	if (!lc->dev) pr_warn("no dev\n");
 	return lc->dev;
 
 }
@@ -155,13 +157,16 @@ static void persist_status(struct dm_target *ti, status_type_t type,
 static int persist_iterate_devices(struct dm_target *ti,
 				  iterate_devices_callout_fn fn, void *data)
 {
+	if (!ti) pr_warn("no ti\n");
+	if (!ti->private) pr_warn("no private\n");
+	if (!data) pr_warn("no data\n");
 	struct persist_c *lc = ti->private;
 
 	return fn(ti, get_dev(lc), lc->start, ti->len, data);
 }
 
 static struct target_type persist_target = {
-	.name   = "persist3",
+	.name   = "persist2",
 	.version = {1, 4, 0},
 	.features = DM_TARGET_PASSES_INTEGRITY | DM_TARGET_NOWAIT |
 		    DM_TARGET_ZONED_HM | DM_TARGET_PASSES_CRYPTO,
