@@ -35,6 +35,16 @@ struct persist_c {
 	sector_t start;
 };
 
+static char * normalize_path(char * path) // allow paths retrieved from sysfs
+{
+    if (!strncmp(path, "/sys/", 5)) return path + 4;
+    if (path[0] == '.' && path[1] == '/') path += 1;
+    if (path[0] == '.' && path[1] == '.' && path[2] == '/') path += 2;
+    while (!strncmp(path, "/../", 4)) path += 3;
+
+    return path;
+}
+
 /*
  * Construct a persist mapping: <dev_path> <offset>
  */
@@ -46,6 +56,7 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	int ret;
 	char * devpath;
 	struct dm_dev * dev;
+	char * match_path;
 
 	if (argc != 3) {
 		ti->error = "Invalid argument count";
@@ -73,15 +84,18 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	devpath = kobject_get_path(&disk_to_dev(lc->dev->bdev->bd_disk)->kobj, GFP_KERNEL);
 
-	lc->match_len = strlen(argv[1]);
-	if (memcmp(devpath, argv[1], lc->match_len)) {
+	match_path = normalize_path(argv[1]);
+	lc->match_len = strlen(match_path);
+
+	if (memcmp(devpath, match_path, lc->match_len)) {
 		pr_warn("persist: Device is not on path: %s != %s\n", devpath, argv[1]);
 		ti->error = "Device is not on provided path";
 		kfree(devpath);
 		dm_put_device(ti, dev);
 		goto bad;
 	}
-	kfree(devpath);
+	devpath[lc->match_len] = '\0';
+	lc->match_path = devpath;
 
 	lc->dev = dev;
 	ti->num_flush_bios = 1;
@@ -100,6 +114,7 @@ static void persist_dtr(struct dm_target *ti)
 {
 	struct persist_c *lc = (struct persist_c *) ti->private;
 
+	kfree(lc->match_path);
 	dm_put_device(ti, lc->dev);
 	kfree(lc);
 }
@@ -113,14 +128,11 @@ static sector_t persist_map_sector(struct dm_target *ti, sector_t bi_sector)
 
 static struct dm_dev * get_dev(struct persist_c *lc)
 {
-	//if (lc->dev->bdev->bd_disk->state == (1<<MD_DISK_REMOVED)) {
+	if (lc->dev && lc->dev->bdev->bd_disk->state == (1<<MD_DISK_REMOVED)) {
 		// wait on update with new disk, using timeout;
 		// if we timeout, suspend <until flagged is toggled>
 		// check toggle value: return old disk, can we just put the old disk and quit somehow?
-	//}
-	//pr_warn("dev flags: %i, state: %lu\n", lc->dev->bdev->bd_disk->flags, lc->dev->bdev->bd_disk->state);
-	if (!lc) pr_warn ("no lc\n");
-	if (!lc->dev) pr_warn("no dev\n");
+	}
 	return lc->dev;
 
 }
