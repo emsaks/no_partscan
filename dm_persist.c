@@ -72,8 +72,8 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	devpath = kobject_get_path(&lc->dev->bdev->bd_device.kobj, GFP_KERNEL);
 
 	lc->match_len = strlen(argv[1]);
-	if (memcmp(devpath, argv[1], lc->match_len)) {
-		pr_warn("persist: dev not on path");
+	if (1) { //memcmp(devpath, argv[1], lc->match_len)) {
+		pr_warn("persist: Device is not on path: %s != %s\n", devpath, argv[1]);
 		ti->error = "Device is not on provided path";
 		kfree(devpath);
 		dm_put_device(ti, lc->dev);
@@ -110,12 +110,12 @@ static sector_t persist_map_sector(struct dm_target *ti, sector_t bi_sector)
 
 static struct dm_dev * get_dev(struct persist_c *lc)
 {
-	if (lc->dev->bdev->bd_disk->state == (1<<MD_DISK_REMOVED)) {
+	//if (lc->dev->bdev->bd_disk->state == (1<<MD_DISK_REMOVED)) {
 		// wait on update with new disk, using timeout;
 		// if we timeout, suspend <until flagged is toggled>
 		// check toggle value: return old disk, can we just put the old disk and quit somehow?
-	}
-	pr_warn("dev flags: %i, state: %lu\n", lc->dev->bdev->bd_disk->flags, lc->dev->bdev->bd_disk->state);
+	//}
+	//pr_warn("dev flags: %i, state: %lu\n", lc->dev->bdev->bd_disk->flags, lc->dev->bdev->bd_disk->state);
 	return lc->dev;
 
 }
@@ -161,7 +161,7 @@ static int persist_iterate_devices(struct dm_target *ti,
 }
 
 static struct target_type persist_target = {
-	.name   = "persist",
+	.name   = "persist3",
 	.version = {1, 4, 0},
 	.features = DM_TARGET_PASSES_INTEGRITY | DM_TARGET_NOWAIT |
 		    DM_TARGET_ZONED_HM | DM_TARGET_PASSES_CRYPTO,
