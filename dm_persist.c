@@ -33,6 +33,7 @@ struct persist_c {
 	char * match_path;
 	int match_len;
 	sector_t start;
+	struct kretprobe probe;
 };
 
 static char * normalize_path(char * path) // allow paths retrieved from sysfs
@@ -43,6 +44,35 @@ static char * normalize_path(char * path) // allow paths retrieved from sysfs
     while (!strncmp(path, "/../", 4)) path += 3;
 
     return path;
+}
+
+#include "regs.h"
+
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,7,10)
+#define ARG ARG1
+static char func_name[NAME_MAX] = "add_disk";
+#else // after 4.7.10, add_disk is a macro pointing to device_add_disk, which has the disk as its 2nd argument
+#define ARG ARG2
+static char func_name[NAME_MAX] = "device_add_disk";
+#endif
+
+static int plant_probe(struct persist_c *lc)
+{
+	int ret;
+
+	lc->probe.handler		= ret_handler;
+	lc->probe.entry_handler	= entry_handler;
+	lc->probe.data_size		= sizeof(struct persists_c *); // do we need to define a struct?
+	lc->probe.maxactive		= 20;
+
+    lc->probe.kp.symbol_name = func_name;
+    ret = register_kretprobe(&lc->probe);
+    if (ret < 0) {
+        pr_warn("register_kretprobe failed, returned %d\n", ret);
+        return ret;
+    }
+
+	return 0;
 }
 
 /*
@@ -90,12 +120,16 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	if (memcmp(devpath, match_path, lc->match_len)) {
 		pr_warn("persist: Device is not on path: %s != %s\n", devpath, argv[1]);
 		ti->error = "Device is not on provided path";
-		kfree(devpath);
-		dm_put_device(ti, dev);
-		goto bad;
+		goto bad2;
 	}
+
 	devpath[lc->match_len] = '\0';
 	lc->match_path = devpath;
+
+	if (plant_probe) {
+		t->error = "Failed to plant probe on add_device";
+		goto bad2;
+	}
 
 	lc->dev = dev;
 	ti->num_flush_bios = 1;
@@ -105,6 +139,9 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	ti->private = lc;
 	return 0;
 
+	  bad2:
+	kfree(devpath);
+	dm_put_device(ti, dev);
       bad:
 	kfree(lc);
 	return ret;
@@ -115,6 +152,8 @@ static void persist_dtr(struct dm_target *ti)
 	struct persist_c *lc = (struct persist_c *) ti->private;
 
 	kfree(lc->match_path);
+	unregister_kretprobe(&lc->probe);
+
 	dm_put_device(ti, lc->dev);
 	kfree(lc);
 }
@@ -186,7 +225,7 @@ static int persist_iterate_devices(struct dm_target *ti,
 #endif
 
 static struct target_type persist_target = {
-	.name   = "persist2",
+	.name   = "persist",
 	.version = {1, 4, 0},
 	.features = DM_TARGET_PASSES_INTEGRITY | DM_TARGET_NOWAIT |
 		    DM_TARGET_ZONED_HM | DM_TARGET_PASSES_CRYPTO,
