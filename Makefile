@@ -1,7 +1,10 @@
-obj-m := dm_persist.o #no_partscan.o badbio.o biosnoop.o dm_persist.o
-#dm_persist2-objs := dm_persist.o
+VER :=
+obj-m := dm_persist$(VER).o #no_partscan.o badbio.o biosnoop.o dm_persist.o
+dm_persist3-objs := dm_persist.o
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
+
+
 default:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 clean:
@@ -12,5 +15,5 @@ bio:
 	insmod badbio.ko
 pers:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
-	if [ -e /sys/module/dm_persist ]; then rmmod dm_persist.ko; fi
-	insmod dm_persist.ko
+	if [ -e /sys/module/dm_persist$(VER) ]; then rmmod dm_persist$(VER).ko; fi
+	insmod dm_persist$(VER).ko

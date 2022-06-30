@@ -26,13 +26,14 @@
 #define DM_MSG_PREFIX "persist"
 
 /*
- * persist: maps a persist range of a device.
+ * persist: maps a persistent range of a device.
  */
 struct persist_c {
 	struct dm_dev *dev;
 	char * match_path;
 	int match_len;
 	sector_t start;
+	atomic_t ios_in_flight;
 	struct kretprobe probe;
 };
 
@@ -55,6 +56,16 @@ static char func_name[NAME_MAX] = "add_disk";
 #define ARG ARG2
 static char func_name[NAME_MAX] = "device_add_disk";
 #endif
+
+static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	return 0;
+}
+
+static int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	return 0;
+}
 
 static int plant_probe(struct persist_c *lc)
 {
@@ -85,7 +96,6 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	char dummy;
 	int ret;
 	char * devpath;
-	struct dm_dev * dev;
 	char * match_path;
 
 	if (argc != 3) {
@@ -106,42 +116,51 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 	lc->start = tmp;
 
-	ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &dev);
+	pr_warn("pre get device\n");
+	ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &lc->dev);
 	if (ret) {
 		ti->error = "Device lookup failed";
 		goto bad;
 	}
-
+	pr_warn("post get device\n");
 	devpath = kobject_get_path(&disk_to_dev(lc->dev->bdev->bd_disk)->kobj, GFP_KERNEL);
 
+	pr_warn("after path\n");
 	match_path = normalize_path(argv[1]);
 	lc->match_len = strlen(match_path);
 
+	pr_warn("after normalize\n");
 	if (memcmp(devpath, match_path, lc->match_len)) {
-		pr_warn("persist: Device is not on path: %s != %s\n", devpath, argv[1]);
+		pr_warn("Device is not on path: %s != %s\n", devpath, argv[1]);
 		ti->error = "Device is not on provided path";
+		ret = -EBADMSG;
 		goto bad2;
 	}
 
+	pr_warn("after cmp\n");
 	devpath[lc->match_len] = '\0';
 	lc->match_path = devpath;
 
-	if (plant_probe) {
-		t->error = "Failed to plant probe on add_device";
+	pr_warn("pre plant\n");
+	if (plant_probe(lc)) {
+		pr_warn("plant fail\n");
+		ti->error = "Failed to plant probe on add_device";
+		ret = -EADDRNOTAVAIL;
 		goto bad2;
 	}
 
-	lc->dev = dev;
+	pr_warn("post plant\n");
+	atomic_set(&lc->ios_in_flight, 0);
+	ti->private = lc;
 	ti->num_flush_bios = 1;
 	ti->num_discard_bios = 1;
 	ti->num_secure_erase_bios = 1;
 	ti->num_write_zeroes_bios = 1;
-	ti->private = lc;
 	return 0;
 
 	  bad2:
 	kfree(devpath);
-	dm_put_device(ti, dev);
+	dm_put_device(ti, lc->dev);
       bad:
 	kfree(lc);
 	return ret;
@@ -167,10 +186,27 @@ static sector_t persist_map_sector(struct dm_target *ti, sector_t bi_sector)
 
 static struct dm_dev * get_dev(struct persist_c *lc)
 {
+	atomic_inc(&lc->ios_in_flight);
+
 	if (lc->dev && lc->dev->bdev->bd_disk->state == (1<<MD_DISK_REMOVED)) {
-		// wait on update with new disk, using timeout;
-		// if we timeout, suspend <until flagged is toggled>
-		// check toggle value: return old disk, can we just put the old disk and quit somehow?
+		if (!atomic_dec_and_test(&lc->ios_in_flight)) {
+			
+		} else {
+			// wait 0 
+		}
+		// we want to make sure all ios acquiesce before releaseing
+		// map() might be in the process of submitting a bio
+		// so we need to increment *before* testing bad disk
+		// if bad, dec_and_test OR wait
+
+		wait_event( , !lc->ios_in_flight)
+		// wait on 0 ios_in_flight;
+		// take lock, release old disk <if not released>
+
+		// wait on new disk
+		// take lock, get new <if not gotten>
+
+		
 	}
 	return lc->dev;
 
@@ -179,9 +215,11 @@ static int persist_map(struct dm_target *ti, struct bio *bio)
 {
 	struct persist_c *lc = ti->private;
 
+	pr_warn("map %lu, of %u\n", bio_offset(bio), bio_sectors(bio));
 	bio_set_dev(bio, get_dev(lc)->bdev);
 	bio->bi_iter.bi_sector = persist_map_sector(ti, bio->bi_iter.bi_sector);
 
+	atomic_inc(&lc->ios_in_flight);
 	return DM_MAPIO_REMAPPED;
 }
 
@@ -210,6 +248,19 @@ static void persist_status(struct dm_target *ti, status_type_t type,
 	}
 }
 
+static int persist_endio(struct dm_target *ti, struct bio *bio, blk_status_t *error)
+{
+	struct persist_c *lc = ti->private;
+
+	pr_warn("endio\n");
+
+	if (!atomic_dec_and_test(&lc->ios_in_flight)) {
+		// todo: if bad disk, wake wait_acquiesce
+	}
+
+	return DM_ENDIO_DONE;
+}
+
 static int persist_iterate_devices(struct dm_target *ti,
 				  iterate_devices_callout_fn fn, void *data)
 {
@@ -233,6 +284,7 @@ static struct target_type persist_target = {
 	.ctr    = persist_ctr,
 	.dtr    = persist_dtr,
 	.map    = persist_map,
+	.end_io = persist_endio,
 	.status = persist_status,
 	.iterate_devices = persist_iterate_devices,
 };
