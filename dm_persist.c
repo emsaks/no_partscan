@@ -17,7 +17,7 @@
 #include <linux/raid/md_p.h>
 #include <linux/version.h>
 #include <linux/mutex.h>
-#include <linux/
+#include <linux/completion.h>
 
 #ifndef bdev_kobj
 	#define bdev_kobj(_bdev) (&(disk_to_dev((_bdev)->bd_disk)->kobj))
@@ -38,12 +38,18 @@
  * persist: maps a persistent range of a device.
  */
 struct persist_c {
+	struct completion disk_added;
+	atomic_t next_dev;
+	dev_t this_dev;
 	struct dm_dev *dev;
 	char * match_path;
 	int match_len;
 	sector_t start;
+	struct completion ios_finished;
 	atomic_t ios_in_flight;
-	struct kretprobe probe;
+	struct kretprobe probe_add, probe_del;
+	struct mutex dev_lock;
+	struct mutex io_lock;
 };
 
 static char * normalize_path(char * path) // allow paths retrieved from sysfs
@@ -60,34 +66,65 @@ static char * normalize_path(char * path) // allow paths retrieved from sysfs
 
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(4,7,10)
 #define ARG ARG1
-static char func_name[NAME_MAX] = "add_disk";
+static char add_func[NAME_MAX] = "add_disk";
 #else // after 4.7.10, add_disk is a macro pointing to device_add_disk, which has the disk as its 2nd argument
 #define ARG ARG2
-static char func_name[NAME_MAX] = "device_add_disk";
+static char add_func[NAME_MAX] = "device_add_disk";
 #endif
 
-static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+static int add_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
+	return 0; // stash for ret
+}
+
+static int add_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct persist_c * lc = *(struct persist_c **)(ri->data);
+	// todo: check success
+	complete(&lc->disk_added);
+	return 0; // set, wake
+}
+
+static int del_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct persist_c * lc = *(struct persist_c **)(ri->data);
+	dev_t del_dev;
+
+	if (atomic_cmpxchg(&lc->next_dev, del_dev, 0) == del_dev)
+		return 0;
+
+	if (lc->this_dev == del_dev) lc->this_dev = 0;
+
 	return 0;
 }
 
-static int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	return 0;
-}
+static int del_ret(struct kretprobe_instance *ri, struct pt_regs *regs) { return 0; }
 
 static int plant_probe(struct persist_c *lc)
 {
 	int ret;
 
-	lc->probe.handler		= ret_handler;
-	lc->probe.entry_handler	= entry_handler;
-	lc->probe.data_size		= sizeof(struct persists_c *); // do we need to define a struct?
-	lc->probe.maxactive		= 20;
+	lc->probe_add.handler		= add_ret;
+	lc->probe_add.entry_handler	= add_entry;
+	lc->probe_add.data_size		= sizeof(struct persists_c *); // do we need to define a struct?
+	lc->probe_add.maxactive		= 20;
 
-    lc->probe.kp.symbol_name = func_name;
-    ret = register_kretprobe(&lc->probe);
+    lc->probe_add.kp.symbol_name = add_func;
+    ret = register_kretprobe(&lc->probe_add);
     if (ret < 0) {
+        pr_warn("register_kretprobe failed, returned %d\n", ret);
+        return ret;
+    }
+
+	lc->probe_del.handler		= del_ret;
+	lc->probe_del.entry_handler	= del_entry;
+	lc->probe_del.data_size		= sizeof(struct persists_c *); // do we need to define a struct?
+	lc->probe_del.maxactive		= 20;
+	lc->probe_del.kp.symbol_name = "disk_del";
+    
+	ret = register_kretprobe(&lc->probe_del);
+    if (ret < 0) {
+		unregister_kretprobe(&lc->probe_add);
         pr_warn("register_kretprobe failed, returned %d\n", ret);
         return ret;
     }
@@ -180,7 +217,8 @@ static void persist_dtr(struct dm_target *ti)
 	struct persist_c *lc = (struct persist_c *) ti->private;
 
 	kfree(lc->match_path);
-	unregister_kretprobe(&lc->probe);
+	unregister_kretprobe(&lc->probe_add);
+	unregister_kretprobe(&lc->probe_del);
 
 	dm_put_device(ti, lc->dev);
 	kfree(lc);
@@ -193,40 +231,38 @@ static sector_t persist_map_sector(struct dm_target *ti, sector_t bi_sector)
 	return lc->start + dm_target_offset(ti, bi_sector);
 }
 
-static struct dm_dev * get_dev(struct persist_c *lc)
+static struct dm_dev * get_dev(struct dm_target *ti)
 {
-	atomic_inc(&lc->ios_in_flight);
+	struct dm_dev *new;
+	struct dm_dev * old;
+	struct persist_c *lc = ti->private;
 
-	//if (lc->dev && lc->dev->bdev->bd_disk->state == (1<<MD_DISK_REMOVED)) {
-	if (lc->dev && (!disk_is_valid(lc->dev->bdev))) {
-		if (!atomic_dec_and_test(&lc->ios_in_flight)) {
-			
-		} else {
-			// wait 0 
+	mutex_lock(&lc->io_lock); {
+		if (!lc->this_dev) { // cleared by disk_del
+			wait_for_completion(&lc->ios_finished);
+wait:		wait_for_completion(&lc->disk_added);
+			do {
+				lc->this_dev = atomic_read(&lc->next_dev);
+			} while (atomic_cmpxchg(&lc->next_dev, lc->this_dev, 0) != lc->this_dev);
+
+			//if (dm_get_device())
+				 goto wait;
+
+			old = lc->dev;
+			lc->dev = new;
+			dm_put_device(ti, old);
 		}
-		// we want to make sure all ios acquiesce before releaseing
-		// map() might be in the process of submitting a bio
-		// so we need to increment *before* testing bad disk
-		// if bad, dec_and_test OR wait
+		atomic_inc(&lc->ios_in_flight);
+	} mutex_unlock(&lc->io_lock);
 
-		//wait_event( , !lc->ios_in_flight)
-		// wait on 0 ios_in_flight;
-		// take lock, release old disk <if not released>
-
-		// wait on new disk
-		// take lock, get new <if not gotten>
-
-		
-	}
 	return lc->dev;
-
 }
 static int persist_map(struct dm_target *ti, struct bio *bio)
 {
 	struct persist_c *lc = ti->private;
 
 	pr_warn("map %lu, of %u\n", bio_offset(bio), bio_sectors(bio));
-	bio_set_dev(bio, get_dev(lc)->bdev);
+	bio_set_dev(bio, get_dev(ti)->bdev);
 	bio->bi_iter.bi_sector = persist_map_sector(ti, bio->bi_iter.bi_sector);
 
 	atomic_inc(&lc->ios_in_flight);
@@ -245,13 +281,13 @@ static void persist_status(struct dm_target *ti, status_type_t type,
 		break;
 
 	case STATUSTYPE_TABLE:
-		DMEMIT("%s %llu", get_dev(lc)->name, (unsigned long long)lc->start);
+		DMEMIT("%s %llu", lc->dev->name, (unsigned long long)lc->start);
 		break;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,15,0)
 	case STATUSTYPE_IMA:
 		DMEMIT_TARGET_NAME_VERSION(ti->type);
-		DMEMIT(",device_name=%s,start=%llu;", get_dev(lc)->name,
+		DMEMIT(",device_name=%s,start=%llu;", lc->dev->name,
 		       (unsigned long long)lc->start);
 		break;
 #endif
@@ -264,8 +300,8 @@ static int persist_endio(struct dm_target *ti, struct bio *bio, blk_status_t *er
 
 	pr_warn("endio\n");
 
-	if (!atomic_dec_and_test(&lc->ios_in_flight)) {
-		// todo: if bad disk, wake wait_acquiesce
+	if (atomic_dec_and_test(&lc->ios_in_flight)) {
+		complete(&lc->ios_finished);
 	}
 
 	return DM_ENDIO_DONE;
@@ -276,7 +312,7 @@ static int persist_iterate_devices(struct dm_target *ti,
 {
 	struct persist_c *lc = ti->private;
 
-	return fn(ti, get_dev(lc), lc->start, ti->len, data);
+	return fn(ti, lc->dev, lc->start, ti->len, data);
 }
 #ifndef DM_TARGET_PASSES_CRYPTO
 	#define DM_TARGET_PASSES_CRYPTO 0
