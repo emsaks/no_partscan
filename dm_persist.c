@@ -16,7 +16,16 @@
 #include <linux/device-mapper.h>
 #include <linux/raid/md_p.h>
 #include <linux/version.h>
+#include <linux/mutex.h>
+#include <linux/
 
+#ifndef bdev_kobj
+	#define bdev_kobj(_bdev) (&(disk_to_dev((_bdev)->bd_disk)->kobj))
+#endif
+
+#define disk_is_valid(_bdev) \
+	((_bdev)->bd_disk->ev->node.next == (_bdev)->bd_disk->ev->node.next \
+	&& (_bdev)->bd_disk->ev->node.next == &((_bdev)->bd_disk->ev.node))
 /*
  * Copyright (C) 2001-2003 Sistina Software (UK) Limited.
  *
@@ -123,7 +132,7 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad;
 	}
 	pr_warn("post get device\n");
-	devpath = kobject_get_path(&disk_to_dev(lc->dev->bdev->bd_disk)->kobj, GFP_KERNEL);
+	devpath = kobject_get_path(bdev_kobj(lc->dev->bdev), GFP_KERNEL);
 
 	pr_warn("after path\n");
 	match_path = normalize_path(argv[1]);
@@ -188,7 +197,8 @@ static struct dm_dev * get_dev(struct persist_c *lc)
 {
 	atomic_inc(&lc->ios_in_flight);
 
-	if (lc->dev && lc->dev->bdev->bd_disk->state == (1<<MD_DISK_REMOVED)) {
+	//if (lc->dev && lc->dev->bdev->bd_disk->state == (1<<MD_DISK_REMOVED)) {
+	if (lc->dev && (!disk_is_valid(lc->dev->bdev))) {
 		if (!atomic_dec_and_test(&lc->ios_in_flight)) {
 			
 		} else {
@@ -199,7 +209,7 @@ static struct dm_dev * get_dev(struct persist_c *lc)
 		// so we need to increment *before* testing bad disk
 		// if bad, dec_and_test OR wait
 
-		wait_event( , !lc->ios_in_flight)
+		//wait_event( , !lc->ios_in_flight)
 		// wait on 0 ios_in_flight;
 		// take lock, release old disk <if not released>
 
