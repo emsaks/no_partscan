@@ -37,6 +37,7 @@
  * persist: maps a persistent range of a device.
  */
 struct persist_c {
+	struct block_device * other_block;
 	struct completion disk_added;
 	atomic_t next_dev;
 	dev_t this_dev;
@@ -88,12 +89,14 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	pr_warn("enter ctr\n");
 	if (argc != 3) {
 		ti->error = "Invalid argument count";
+		atomic_dec(&instances);
 		return -EINVAL;
 	}
 
 	lc = kmalloc(sizeof(*lc), GFP_KERNEL);
 	if (lc == NULL) {
 		ti->error = "Cannot allocate persist context";
+		atomic_dec(&instances);
 		return -ENOMEM;
 	}
 	pr_warn("after alloc\n");
@@ -109,6 +112,7 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	
 
 	pr_warn("pre get device\n");
+	pr_warn("dm mode: %u\n", dm_table_get_mode(ti->table));
 	ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &lc->dev);
 	if (ret) {
 		ti->error = "Device lookup failed";
@@ -154,6 +158,7 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	dm_put_device(ti, lc->dev);
       bad:
 	kfree(lc);
+	atomic_dec(&instances);
 	return ret;
 }
 
@@ -164,7 +169,7 @@ static void persist_dtr(struct dm_target *ti)
 	kfree(lc->match_path);
 	dm_put_device(ti, lc->dev);
 	atomic_dec(&instances);
-
+	g = NULL;
 	kfree(lc);
 }
 
@@ -175,11 +180,12 @@ static sector_t persist_map_sector(struct dm_target *ti, sector_t bi_sector)
 	return lc->start + dm_target_offset(ti, bi_sector);
 }
 
-static struct dm_dev * get_dev(struct dm_target *ti)
+static char * holder = "dm_persist"PERSIST_VER" held disk.";
+static struct block_device * get_dev(struct dm_target *ti)
 {
 	int ret;
-	struct dm_dev *new;
-	struct dm_dev * old;
+	struct block_device *new;
+	struct block_device * old;
 	struct persist_c *lc = ti->private;
 	char devname[9];
 
@@ -204,20 +210,24 @@ wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->new_disk_addtl_jiff
 				lc->this_dev = atomic_read(&lc->next_dev);
 			} while (atomic_cmpxchg(&lc->next_dev, lc->this_dev, 0) != lc->this_dev);
 
-			print_dev_t(devname, lc->this_dev);
-			ret = dm_get_device(ti, devname, dm_table_get_mode(ti->table), &new);
-			if (ret) {
-				pr_warn("Failed to dm_get new disk: %s with error %i\n", devname, ret);
+			new = blkdev_get_by_dev(lc->this_dev, dm_table_get_mode(ti->table), holder);
+
+			if (!new) {
+				pr_warn("Failed to get new disk: %u with error %i\n", lc->this_dev, ret);
 				goto wait;
 			}
 
 			// todo: check size matches
 
-			old = lc->dev;
-			lc->dev = new;
+			old = lc->other_block;
+			lc->other_block = new;
 			if (atomic_read(&lc->ios_in_flight)) {
 				pr_warn("pre put\n");
-				dm_put_device(ti, old);
+				if (old) 
+					blkdev_put(lc->dev->bdev, dm_table_get_mode(ti->table));
+				else { 
+					dm_put_device(ti, lc->dev);
+				}
 				pr_warn("post put\n");
 			} else {
 				atomic_set(&lc->ios_in_flight, 0); // if we timed out, just forget the device
@@ -228,18 +238,18 @@ wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->new_disk_addtl_jiff
 	} mutex_unlock(&lc->io_lock);
 
 	pr_warn("return dev\n");
-	return lc->dev;
+	return lc->other_block ? lc->other_block : lc->dev->bdev;
 }
 
 static int persist_map(struct dm_target *ti, struct bio *bio)
 {
 	struct persist_c *lc = ti->private;
 
-	struct dm_dev * dev = get_dev(ti);
+	struct block_device * dev = get_dev(ti);
 	if (!dev) return DM_MAPIO_KILL;
 
 	pr_warn("map %lu, of %u\n", bio_offset(bio), bio_sectors(bio));
-	bio_set_dev(bio, dev->bdev);
+	bio_set_dev(bio, dev);
 	bio->bi_iter.bi_sector = persist_map_sector(ti, bio->bi_iter.bi_sector);
 
 	atomic_inc(&lc->ios_in_flight);
@@ -290,7 +300,7 @@ static int persist_iterate_devices(struct dm_target *ti,
 				  iterate_devices_callout_fn fn, void *data)
 {
 	struct persist_c *lc = ti->private;
-
+	if (lc->other_block) return 0; // todo: is this ok?
 	return fn(ti, lc->dev, lc->start, ti->len, data);
 }
 #ifndef DM_TARGET_PASSES_CRYPTO
@@ -326,7 +336,9 @@ static char add_func[NAME_MAX] = "device_add_disk";
 
 static int add_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	*ri->data = regs->ARG;
+	pr_warn("add dev %p\n", (void*)regs->ARG);
+	
+	*(struct gendisk **)ri->data = regs->ARG;
 	return 0;
 }
 
@@ -346,8 +358,11 @@ static int add_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	devpath = kobject_get_path(&disk_to_dev(disk)->kobj, GFP_KERNEL);
 	pr_warn("after path\n");
 	
+	READ_ONCE(g);
+
 	if (!devpath) { pr_warn("no devpath\n"); return 0; }
 	if (!g) { pr_warn("no g\n"); return 0; }
+
 	if (memcmp(devpath, g->match_path, g->match_len)) {
 		pr_warn("device is not on path: %s != %s\n", devpath, g->match_path);
 		goto out;
@@ -369,10 +384,15 @@ out:
 static int del_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {	
 	struct gendisk * disk = (struct gendisk *)regs->ARG1;
-	dev_t del_dev = disk_devt(disk);
 	
+	if (!disk) { pr_warn("del no disk\n"); return 0; }
+
+	dev_t del_dev = disk_devt(disk);
+	READ_ONCE(g);
+	if (!g) { pr_warn("del g empty\n"); return 0; }
+
 	pr_warn("del dev %u", del_dev);
-	/*if (atomic_cmpxchg(&g->next_dev, del_dev, 0) == del_dev) {
+	if (atomic_cmpxchg(&g->next_dev, del_dev, 0) == del_dev) {
 		pr_warn("clear next dev");
 		return 0;
 	}
@@ -380,7 +400,7 @@ static int del_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	if (g->this_dev == del_dev) {
 		pr_warn("clear this dev");
 		g->this_dev = 0;
-	}*/
+	}
 
 	return 0;
 }
