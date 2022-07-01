@@ -87,18 +87,21 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 	lc->start = tmp;
 
+	pr_warn("pre inc instances\n");
 	if (atomic_inc_return(&instances) > 1) {
+		pr_warn("pre dec instances\n");
 		atomic_dec(&instances);
 		ti->error = "Mulitple instances not supported";
 		return -ENOTSUPP;
 	}
+	pr_warn("post inc instances\n");
 	
 	lc = kmalloc(sizeof(*lc), GFP_KERNEL);
 	if (lc == NULL) {
 		ti->error = "Cannot allocate persist context";
 		return -ENOMEM;
 	}
-
+	pr_warn("after alloc\n");
 	memset(lc, 0, sizeof(*lc));
 	pr_warn("pre get device\n");
 	ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &lc->dev);
@@ -292,7 +295,7 @@ static int persist_iterate_devices(struct dm_target *ti,
 #endif
 
 static struct target_type persist_target = {
-	.name   = "persist",
+	.name   = "persist2",
 	.version = {1, 4, 0},
 	.features = DM_TARGET_PASSES_INTEGRITY | DM_TARGET_NOWAIT |
 		    DM_TARGET_ZONED_HM | DM_TARGET_PASSES_CRYPTO,
@@ -332,7 +335,8 @@ static int add_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	disk = *(struct gendisk **)(ri->data);
 	
 	pr_warn("pre get path\n");
-	devpath = kobject_get_path(bdev_kobj(g->dev->bdev), GFP_KERNEL);
+	
+	devpath = kobject_get_path(&disk_to_dev(disk)->kobj, GFP_KERNEL);
 	pr_warn("after path\n");
 	
 	if (memcmp(devpath, g->match_path, g->match_len)) {
@@ -342,10 +346,11 @@ static int add_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	pr_warn("after cmp\n");
 
 	// todo: check size matches!
+	// to check proper number of trailing parts
 
-	atomic_set(&g->next_dev, disk_devt(disk));
+	//atomic_set(&g->next_dev, disk_devt(disk));
 	pr_warn("calling disk complete");
-	complete(&g->disk_added);
+	//complete(&g->disk_added);
 	pr_warn("post calling disk complete");
 out:
 	kfree(devpath);
@@ -353,14 +358,12 @@ out:
 }
 
 static int del_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct persist_c * g = *(struct persist_c **)(ri->data);
-	
+{	
 	struct gendisk * disk = (struct gendisk *)regs->ARG1;
 	dev_t del_dev = disk_devt(disk);
 	
 	pr_warn("del dev %u", del_dev);
-	if (atomic_cmpxchg(&g->next_dev, del_dev, 0) == del_dev) {
+	/*if (atomic_cmpxchg(&g->next_dev, del_dev, 0) == del_dev) {
 		pr_warn("clear next dev");
 		return 0;
 	}
@@ -368,7 +371,7 @@ static int del_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	if (g->this_dev == del_dev) {
 		pr_warn("clear this dev");
 		g->this_dev = 0;
-	}
+	}*/
 
 	return 0;
 }
@@ -408,19 +411,19 @@ int __init dm_persist_init(void)
 	r = register_kretprobe(&add_probe);
     if (r < 0) {
         pr_warn("register_kretprobe for add_probe failed, returned %d\n", r);
-		dm_unregister_target(&persist_target);
 		unregister_kretprobe(&del_probe);
+		dm_unregister_target(&persist_target);
         return r;
     }
 
-	return r;
+	return 0;
 }
 
 void dm_persist_exit(void)
 {
-	dm_unregister_target(&persist_target);
 	unregister_kretprobe(&del_probe);
 	unregister_kretprobe(&add_probe);
+	dm_unregister_target(&persist_target);
 }
 
 module_init(dm_persist_init)
