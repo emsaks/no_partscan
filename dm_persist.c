@@ -23,9 +23,6 @@
 	#define bdev_kobj(_bdev) (&(disk_to_dev((_bdev)->bd_disk)->kobj))
 #endif
 
-#define disk_is_valid(_bdev) \
-	((_bdev)->bd_disk->ev->node.next == (_bdev)->bd_disk->ev->node.next \
-	&& (_bdev)->bd_disk->ev->node.next == &((_bdev)->bd_disk->ev.node))
 /*
  * Copyright (C) 2001-2003 Sistina Software (UK) Limited.
  *
@@ -47,10 +44,11 @@ struct persist_c {
 	sector_t start;
 	struct completion ios_finished;
 	atomic_t ios_in_flight;
-	struct kretprobe probe_add, probe_del;
-	struct mutex dev_lock;
 	struct mutex io_lock;
-};
+	int timed_out;
+	int io_timeout_jiffies;
+	int new_disk_addtl_jiffies;
+} * g;
 
 static char * normalize_path(char * path) // allow paths retrieved from sysfs
 {
@@ -60,76 +58,6 @@ static char * normalize_path(char * path) // allow paths retrieved from sysfs
     while (!strncmp(path, "/../", 4)) path += 3;
 
     return path;
-}
-
-#include "regs.h"
-
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,7,10)
-#define ARG ARG1
-static char add_func[NAME_MAX] = "add_disk";
-#else // after 4.7.10, add_disk is a macro pointing to device_add_disk, which has the disk as its 2nd argument
-#define ARG ARG2
-static char add_func[NAME_MAX] = "device_add_disk";
-#endif
-
-static int add_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	return 0; // stash for ret
-}
-
-static int add_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct persist_c * lc = *(struct persist_c **)(ri->data);
-	// todo: check success
-	complete(&lc->disk_added);
-	return 0; // set, wake
-}
-
-static int del_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct persist_c * lc = *(struct persist_c **)(ri->data);
-	dev_t del_dev;
-
-	if (atomic_cmpxchg(&lc->next_dev, del_dev, 0) == del_dev)
-		return 0;
-
-	if (lc->this_dev == del_dev) lc->this_dev = 0;
-
-	return 0;
-}
-
-static int del_ret(struct kretprobe_instance *ri, struct pt_regs *regs) { return 0; }
-
-static int plant_probe(struct persist_c *lc)
-{
-	int ret;
-
-	lc->probe_add.handler		= add_ret;
-	lc->probe_add.entry_handler	= add_entry;
-	lc->probe_add.data_size		= sizeof(struct persists_c *); // do we need to define a struct?
-	lc->probe_add.maxactive		= 20;
-
-    lc->probe_add.kp.symbol_name = add_func;
-    ret = register_kretprobe(&lc->probe_add);
-    if (ret < 0) {
-        pr_warn("register_kretprobe failed, returned %d\n", ret);
-        return ret;
-    }
-
-	lc->probe_del.handler		= del_ret;
-	lc->probe_del.entry_handler	= del_entry;
-	lc->probe_del.data_size		= sizeof(struct persists_c *); // do we need to define a struct?
-	lc->probe_del.maxactive		= 20;
-	lc->probe_del.kp.symbol_name = "disk_del";
-    
-	ret = register_kretprobe(&lc->probe_del);
-    if (ret < 0) {
-		unregister_kretprobe(&lc->probe_add);
-        pr_warn("register_kretprobe failed, returned %d\n", ret);
-        return ret;
-    }
-
-	return 0;
 }
 
 /*
@@ -187,16 +115,10 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	devpath[lc->match_len] = '\0';
 	lc->match_path = devpath;
 
-	pr_warn("pre plant\n");
-	if (plant_probe(lc)) {
-		pr_warn("plant fail\n");
-		ti->error = "Failed to plant probe on add_device";
-		ret = -EADDRNOTAVAIL;
-		goto bad2;
-	}
-
-	pr_warn("post plant\n");
 	atomic_set(&lc->ios_in_flight, 0);
+	lc->io_timeout_jiffies = 30*HZ;
+	lc->new_disk_addtl_jiffies = 30*HZ;
+
 	ti->private = lc;
 	ti->num_flush_bios = 1;
 	ti->num_discard_bios = 1;
@@ -217,9 +139,6 @@ static void persist_dtr(struct dm_target *ti)
 	struct persist_c *lc = (struct persist_c *) ti->private;
 
 	kfree(lc->match_path);
-	unregister_kretprobe(&lc->probe_add);
-	unregister_kretprobe(&lc->probe_del);
-
 	dm_put_device(ti, lc->dev);
 	kfree(lc);
 }
@@ -238,9 +157,17 @@ static struct dm_dev * get_dev(struct dm_target *ti)
 	struct persist_c *lc = ti->private;
 
 	mutex_lock(&lc->io_lock); {
+		if (lc->timed_out) {
+			mutex_unlock(&lc->io_lock);
+			return NULL;
+		}
 		if (!lc->this_dev) { // cleared by disk_del
-			wait_for_completion(&lc->ios_finished);
-wait:		wait_for_completion(&lc->disk_added);
+			int jiffies = wait_for_completion_io_timeout(&lc->ios_finished, lc->io_timeout_jiffies);
+wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->new_disk_addtl_jiffies + jiffies)) {
+				lc->timed_out = 1;
+				mutex_unlock(&lc->io_lock);
+				return NULL;
+			}
 			do {
 				lc->this_dev = atomic_read(&lc->next_dev);
 			} while (atomic_cmpxchg(&lc->next_dev, lc->this_dev, 0) != lc->this_dev);
@@ -250,10 +177,16 @@ wait:		wait_for_completion(&lc->disk_added);
 
 			old = lc->dev;
 			lc->dev = new;
-			dm_put_device(ti, old);
+			if (atomic_read(&lc->ios_in_flight)) 
+				dm_put_device(ti, old);
+			else 
+				atomic_set(&lc->ios_in_flight, 0); // if we timed out, just forget the device
 		}
 		atomic_inc(&lc->ios_in_flight);
 	} mutex_unlock(&lc->io_lock);
+
+	if (lc->timed_out)
+		return NULL;
 
 	return lc->dev;
 }
@@ -261,8 +194,11 @@ static int persist_map(struct dm_target *ti, struct bio *bio)
 {
 	struct persist_c *lc = ti->private;
 
+	struct dm_dev * dev = get_dev(ti);
+	if (!dev) return DM_MAPIO_KILL;
+
 	pr_warn("map %lu, of %u\n", bio_offset(bio), bio_sectors(bio));
-	bio_set_dev(bio, get_dev(ti)->bdev);
+	bio_set_dev(bio, dev->bdev);
 	bio->bi_iter.bi_sector = persist_map_sector(ti, bio->bi_iter.bi_sector);
 
 	atomic_inc(&lc->ios_in_flight);
@@ -335,6 +271,65 @@ static struct target_type persist_target = {
 	.iterate_devices = persist_iterate_devices,
 };
 
+#include "regs.h"
+
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,7,10)
+#define ARG ARG1
+static char add_func[NAME_MAX] = "add_disk";
+#else // after 4.7.10, add_disk is a macro pointing to device_add_disk, which has the disk as its 2nd argument
+#define ARG ARG2
+static char add_func[NAME_MAX] = "device_add_disk";
+#endif
+
+static int add_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	*ri->data = regs->ARG;
+	return 0;
+}
+
+static int add_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct gendisk * disk;
+
+	if (regs_return_value(regs))
+		return 0;
+
+	disk = *(struct gendisk **)(ri->data);
+	atomic_set(&g->next_dev, disk_devt(disk));
+	complete(&g->disk_added);
+	return 0;
+}
+
+static int del_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct persist_c * g = *(struct persist_c **)(ri->data);
+	
+	struct gendisk * disk = (struct gendisk *)regs->ARG1;
+	dev_t del_dev = disk_devt(disk);
+	
+	if (atomic_cmpxchg(&g->next_dev, del_dev, 0) == del_dev)
+		return 0;
+
+	if (g->this_dev == del_dev) g->this_dev = 0;
+
+	return 0;
+}
+
+static int del_ret(struct kretprobe_instance *ri, struct pt_regs *regs) { return 0; }
+
+static struct kretprobe del_probe = {
+    .handler        = del_ret,
+    .entry_handler  = del_entry,
+    .maxactive      = 20,
+};
+
+static struct kretprobe add_probe = {
+    .handler        = add_ret,
+    .entry_handler  = add_entry,
+    .data_size      = sizeof(struct gendisk *),
+    .maxactive      = 20,
+};
+
 int __init dm_persist_init(void)
 {
 	int r = dm_register_target(&persist_target);
@@ -342,12 +337,32 @@ int __init dm_persist_init(void)
 	if (r < 0)
 		DMERR("register failed %d", r);
 
+	del_probe.kp.symbol_name = "del_gendisk";
+	add_probe.kp.symbol_name = add_func;
+
+	r = register_kretprobe(&del_probe);
+    if (r < 0) {
+        pr_warn("register_kretprobe for del_probe failed, returned %d\n", r);
+		dm_unregister_target(&persist_target);
+        return r;
+    }
+
+	r = register_kretprobe(&add_probe);
+    if (r < 0) {
+        pr_warn("register_kretprobe for add_probe failed, returned %d\n", r);
+		dm_unregister_target(&persist_target);
+		unregister_kretprobe(&del_probe);
+        return r;
+    }
+
 	return r;
 }
 
 void dm_persist_exit(void)
 {
 	dm_unregister_target(&persist_target);
+	unregister_kretprobe(&del_probe);
+	unregister_kretprobe(&add_probe);
 }
 
 module_init(dm_persist_init)
