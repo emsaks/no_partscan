@@ -202,6 +202,8 @@ wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->new_disk_addtl_jiff
 				goto wait;
 			}
 
+			// todo: check size matches
+
 			old = lc->dev;
 			lc->dev = new;
 			if (atomic_read(&lc->ios_in_flight)) {
@@ -322,15 +324,31 @@ static int add_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 static int add_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct gendisk * disk;
+	char * devpath;
 
 	if (regs_return_value(regs))
 		return 0;
 
 	disk = *(struct gendisk **)(ri->data);
+	
+	pr_warn("pre get path\n");
+	devpath = kobject_get_path(bdev_kobj(lc->dev->bdev), GFP_KERNEL);
+	pr_warn("after path\n");
+	
+	if (memcmp(devpath, lc->match_path, lc->match_len)) {
+		pr_warn("device is not on path: %s != %s\n", devpath, lc->match_path);
+		goto out;
+	}
+	pr_warn("after cmp\n");
+
+	// todo: check size matches!
+
 	atomic_set(&g->next_dev, disk_devt(disk));
 	pr_warn("calling disk complete");
 	complete(&g->disk_added);
 	pr_warn("post calling disk complete");
+out:
+	kfree(devpath);
 	return 0;
 }
 
@@ -341,10 +359,16 @@ static int del_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	struct gendisk * disk = (struct gendisk *)regs->ARG1;
 	dev_t del_dev = disk_devt(disk);
 	
-	if (atomic_cmpxchg(&g->next_dev, del_dev, 0) == del_dev)
+	pr_warn("del dev %u", del_dev);
+	if (atomic_cmpxchg(&g->next_dev, del_dev, 0) == del_dev) {
+		pr_warn("clear next dev");
 		return 0;
+	}
 
-	if (g->this_dev == del_dev) g->this_dev = 0;
+	if (g->this_dev == del_dev) {
+		pr_warn("clear this dev");
+		g->this_dev = 0;
+	}
 
 	return 0;
 }
