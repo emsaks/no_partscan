@@ -20,6 +20,7 @@
 #include <linux/completion.h>
 #include <uapi/linux/kdev_t.h>
 
+#define PERSIST_VER "6"
 #ifndef bdev_kobj
 	#define bdev_kobj(_bdev) (&(disk_to_dev((_bdev)->bd_disk)->kobj))
 #endif
@@ -30,7 +31,7 @@
  * This file is released under the GPL.
  */
 
-#define DM_MSG_PREFIX "persist"
+#define DM_MSG_PREFIX "persist"PERSIST_VER
 
 /*
  * persist: maps a persistent range of a device.
@@ -75,18 +76,6 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	char * devpath;
 	char * match_path;
 
-	if (argc != 3) {
-		ti->error = "Invalid argument count";
-		return -EINVAL;
-	}
-
-	ret = -EINVAL;
-	if (sscanf(argv[2], "%llu%c", &tmp, &dummy) != 1 || tmp != (sector_t)tmp) {
-		ti->error = "Invalid device sector";
-		goto bad;
-	}
-	lc->start = tmp;
-
 	pr_warn("pre inc instances\n");
 	if (atomic_inc_return(&instances) > 1) {
 		pr_warn("pre dec instances\n");
@@ -95,7 +84,13 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		return -ENOTSUPP;
 	}
 	pr_warn("post inc instances\n");
-	
+
+	pr_warn("enter ctr\n");
+	if (argc != 3) {
+		ti->error = "Invalid argument count";
+		return -EINVAL;
+	}
+
 	lc = kmalloc(sizeof(*lc), GFP_KERNEL);
 	if (lc == NULL) {
 		ti->error = "Cannot allocate persist context";
@@ -103,6 +98,16 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 	pr_warn("after alloc\n");
 	memset(lc, 0, sizeof(*lc));
+
+	pr_warn("pre scanf\n");
+	ret = -EINVAL;
+	if (sscanf(argv[2], "%llu%c", &tmp, &dummy) != 1 || tmp != (sector_t)tmp) {
+		ti->error = "Invalid device sector";
+		goto bad;
+	}
+	lc->start = tmp;
+	
+
 	pr_warn("pre get device\n");
 	ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &lc->dev);
 	if (ret) {
@@ -131,6 +136,7 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	atomic_set(&lc->ios_in_flight, 0);
 	lc->io_timeout_jiffies = 30*HZ;
 	lc->new_disk_addtl_jiffies = 30*HZ;
+	lc->this_dev = disk_devt(lc->dev->bdev->bd_disk);
 	init_completion(&lc->ios_finished);
 	init_completion(&lc->disk_added);
 	g = lc;
@@ -178,22 +184,22 @@ static struct dm_dev * get_dev(struct dm_target *ti)
 	char devname[9];
 
 	mutex_lock(&lc->io_lock); {
-		pr_warn("entered lock");
+		pr_warn("entered lock\n");
 		if (lc->timed_out) {
-			pr_warn("fast timeout");
+			pr_warn("fast timeout\n");
 			mutex_unlock(&lc->io_lock);
 			return NULL;
 		}
 		if (!lc->this_dev) { // cleared by disk_del
 			int jiffies = wait_for_completion_io_timeout(&lc->ios_finished, lc->io_timeout_jiffies);
-			pr_warn("after io wait");
+			pr_warn("after io wait\n");
 wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->new_disk_addtl_jiffies + jiffies)) {
-				pr_warn("disk timeout");
+				pr_warn("disk timeout\n");
 				lc->timed_out = 1;
 				mutex_unlock(&lc->io_lock);
 				return NULL;
 			}
-			pr_warn("after disk wait");
+			pr_warn("after disk wait\n");
 			do {
 				lc->this_dev = atomic_read(&lc->next_dev);
 			} while (atomic_cmpxchg(&lc->next_dev, lc->this_dev, 0) != lc->this_dev);
@@ -210,18 +216,18 @@ wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->new_disk_addtl_jiff
 			old = lc->dev;
 			lc->dev = new;
 			if (atomic_read(&lc->ios_in_flight)) {
-				pr_warn("pre put");
+				pr_warn("pre put\n");
 				dm_put_device(ti, old);
-				pr_warn("post put");
+				pr_warn("post put\n");
 			} else {
 				atomic_set(&lc->ios_in_flight, 0); // if we timed out, just forget the device
-				pr_warn("forget dev");
+				pr_warn("forget dev\n");
 			}
 		}
 		atomic_inc(&lc->ios_in_flight);
 	} mutex_unlock(&lc->io_lock);
 
-	pr_warn("return dev");
+	pr_warn("return dev\n");
 	return lc->dev;
 }
 
@@ -272,9 +278,9 @@ static int persist_endio(struct dm_target *ti, struct bio *bio, blk_status_t *er
 	pr_warn("endio\n");
 
 	if (atomic_dec_and_test(&lc->ios_in_flight)) {
-		pr_warn("calling io complete");
+		pr_warn("calling io complete\n");
 		complete(&lc->ios_finished);
-		pr_warn("post calling io complete");
+		pr_warn("post calling io complete\n");
 	}
 
 	return DM_ENDIO_DONE;
@@ -295,7 +301,7 @@ static int persist_iterate_devices(struct dm_target *ti,
 #endif
 
 static struct target_type persist_target = {
-	.name   = "persist2",
+	.name   = "persist"PERSIST_VER,
 	.version = {1, 4, 0},
 	.features = DM_TARGET_PASSES_INTEGRITY | DM_TARGET_NOWAIT |
 		    DM_TARGET_ZONED_HM | DM_TARGET_PASSES_CRYPTO,
@@ -334,11 +340,14 @@ static int add_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 	disk = *(struct gendisk **)(ri->data);
 	
-	pr_warn("pre get path\n");
-	
+	pr_warn("pre get path: %p\n", disk);
+	if (!disk) { pr_warn("no disk\n"); return 0; }
+
 	devpath = kobject_get_path(&disk_to_dev(disk)->kobj, GFP_KERNEL);
 	pr_warn("after path\n");
 	
+	if (!devpath) { pr_warn("no devpath\n"); return 0; }
+	if (!g) { pr_warn("no g\n"); return 0; }
 	if (memcmp(devpath, g->match_path, g->match_len)) {
 		pr_warn("device is not on path: %s != %s\n", devpath, g->match_path);
 		goto out;
@@ -348,9 +357,9 @@ static int add_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	// todo: check size matches!
 	// to check proper number of trailing parts
 
-	//atomic_set(&g->next_dev, disk_devt(disk));
+	atomic_set(&g->next_dev, disk_devt(disk));
 	pr_warn("calling disk complete");
-	//complete(&g->disk_added);
+	complete(&g->disk_added);
 	pr_warn("post calling disk complete");
 out:
 	kfree(devpath);
@@ -393,10 +402,7 @@ static struct kretprobe add_probe = {
 
 int __init dm_persist_init(void)
 {
-	int r = dm_register_target(&persist_target);
-
-	if (r < 0)
-		DMERR("register failed %d", r);
+	int r;
 
 	del_probe.kp.symbol_name = "del_gendisk";
 	add_probe.kp.symbol_name = add_func;
@@ -404,17 +410,27 @@ int __init dm_persist_init(void)
 	r = register_kretprobe(&del_probe);
     if (r < 0) {
         pr_warn("register_kretprobe for del_probe failed, returned %d\n", r);
-		dm_unregister_target(&persist_target);
         return r;
     }
+	pr_warn("registered del");
 
 	r = register_kretprobe(&add_probe);
     if (r < 0) {
         pr_warn("register_kretprobe for add_probe failed, returned %d\n", r);
 		unregister_kretprobe(&del_probe);
-		dm_unregister_target(&persist_target);
         return r;
     }
+	pr_warn("registered add");
+	
+	r = dm_register_target(&persist_target);
+
+	if (r < 0) {
+		unregister_kretprobe(&del_probe);
+		unregister_kretprobe(&add_probe);
+		DMERR("register failed %d", r);
+	}
+
+	
 
 	return 0;
 }
@@ -422,8 +438,11 @@ int __init dm_persist_init(void)
 void dm_persist_exit(void)
 {
 	unregister_kretprobe(&del_probe);
+	pr_warn("unregistered del");
 	unregister_kretprobe(&add_probe);
+	pr_warn("unregistered add");
 	dm_unregister_target(&persist_target);
+	pr_warn("unregistered target");
 }
 
 module_init(dm_persist_init)
