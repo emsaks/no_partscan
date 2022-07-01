@@ -50,6 +50,8 @@ struct persist_c {
 	int new_disk_addtl_jiffies;
 } * g;
 
+atomic_t instances;
+
 static char * normalize_path(char * path) // allow paths retrieved from sysfs
 {
     if (!strncmp(path, "/sys/", 5)) return path + 4;
@@ -77,12 +79,6 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		return -EINVAL;
 	}
 
-	lc = kmalloc(sizeof(*lc), GFP_KERNEL);
-	if (lc == NULL) {
-		ti->error = "Cannot allocate persist context";
-		return -ENOMEM;
-	}
-
 	ret = -EINVAL;
 	if (sscanf(argv[2], "%llu%c", &tmp, &dummy) != 1 || tmp != (sector_t)tmp) {
 		ti->error = "Invalid device sector";
@@ -90,6 +86,19 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 	lc->start = tmp;
 
+	if (atomic_inc_return(&instances) > 1) {
+		atomic_dec(&instances);
+		ti->error = "Mulitple instances not supported";
+		return -ENOTSUPP;
+	}
+	
+	lc = kmalloc(sizeof(*lc), GFP_KERNEL);
+	if (lc == NULL) {
+		ti->error = "Cannot allocate persist context";
+		return -ENOMEM;
+	}
+
+	memset(lc, 0, sizeof(*lc));
 	pr_warn("pre get device\n");
 	ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &lc->dev);
 	if (ret) {
@@ -118,6 +127,10 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	atomic_set(&lc->ios_in_flight, 0);
 	lc->io_timeout_jiffies = 30*HZ;
 	lc->new_disk_addtl_jiffies = 30*HZ;
+	init_completion(&lc->ios_finished);
+	init_completion(&lc->disk_added);
+	g = lc;
+	pr_warn("after init\n");
 
 	ti->private = lc;
 	ti->num_flush_bios = 1;
@@ -140,6 +153,8 @@ static void persist_dtr(struct dm_target *ti)
 
 	kfree(lc->match_path);
 	dm_put_device(ti, lc->dev);
+	atomic_dec(&instances);
+
 	kfree(lc);
 }
 
@@ -152,42 +167,55 @@ static sector_t persist_map_sector(struct dm_target *ti, sector_t bi_sector)
 
 static struct dm_dev * get_dev(struct dm_target *ti)
 {
+	int ret;
 	struct dm_dev *new;
 	struct dm_dev * old;
 	struct persist_c *lc = ti->private;
+	char devname[9];
 
 	mutex_lock(&lc->io_lock); {
+		pr_warn("entered lock");
 		if (lc->timed_out) {
+			pr_warn("fast timeout");
 			mutex_unlock(&lc->io_lock);
 			return NULL;
 		}
 		if (!lc->this_dev) { // cleared by disk_del
 			int jiffies = wait_for_completion_io_timeout(&lc->ios_finished, lc->io_timeout_jiffies);
+			pr_warn("after io wait");
 wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->new_disk_addtl_jiffies + jiffies)) {
+				pr_warn("disk timeout");
 				lc->timed_out = 1;
 				mutex_unlock(&lc->io_lock);
 				return NULL;
 			}
+			pr_warn("after disk wait");
 			do {
 				lc->this_dev = atomic_read(&lc->next_dev);
 			} while (atomic_cmpxchg(&lc->next_dev, lc->this_dev, 0) != lc->this_dev);
 
-			//if (dm_get_device())
-				 goto wait;
+			snprintf(devname, sizeof(devname) - 1, "%u:%u", MAJOR(lc->this_dev), MINOR(lc->this_dev));
+
+			ret = dm_get_device(ti, devname, dm_table_get_mode(ti->table), &new);
+			if (ret) {
+				pr_warn("Failed to dm_get new disk: %s with error %i\n", devname, ret);
+				goto wait;
+			}
 
 			old = lc->dev;
 			lc->dev = new;
-			if (atomic_read(&lc->ios_in_flight)) 
+			if (atomic_read(&lc->ios_in_flight)) {
+				pr_warn("pre put");
 				dm_put_device(ti, old);
-			else 
+				pr_warn("post put");
+			} else 
 				atomic_set(&lc->ios_in_flight, 0); // if we timed out, just forget the device
+			}
 		}
 		atomic_inc(&lc->ios_in_flight);
 	} mutex_unlock(&lc->io_lock);
 
-	if (lc->timed_out)
-		return NULL;
-
+	pr_warn("return dev");
 	return lc->dev;
 }
 static int persist_map(struct dm_target *ti, struct bio *bio)
@@ -237,7 +265,9 @@ static int persist_endio(struct dm_target *ti, struct bio *bio, blk_status_t *er
 	pr_warn("endio\n");
 
 	if (atomic_dec_and_test(&lc->ios_in_flight)) {
+		pr_warn("calling io complete");
 		complete(&lc->ios_finished);
+		pr_warn("post calling io complete");
 	}
 
 	return DM_ENDIO_DONE;
@@ -296,7 +326,9 @@ static int add_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 	disk = *(struct gendisk **)(ri->data);
 	atomic_set(&g->next_dev, disk_devt(disk));
+	pr_warn("calling disk complete");
 	complete(&g->disk_added);
+	pr_warn("post calling disk complete");
 	return 0;
 }
 
