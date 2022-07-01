@@ -208,8 +208,9 @@ wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->new_disk_addtl_jiff
 				pr_warn("pre put");
 				dm_put_device(ti, old);
 				pr_warn("post put");
-			} else 
+			} else  {
 				atomic_set(&lc->ios_in_flight, 0); // if we timed out, just forget the device
+				pr_warn("forget dev");
 			}
 		}
 		atomic_inc(&lc->ios_in_flight);
@@ -218,6 +219,7 @@ wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->new_disk_addtl_jiff
 	pr_warn("return dev");
 	return lc->dev;
 }
+
 static int persist_map(struct dm_target *ti, struct bio *bio)
 {
 	struct persist_c *lc = ti->private;
