@@ -18,6 +18,7 @@
 #include <linux/version.h>
 #include <linux/mutex.h>
 #include <linux/completion.h>
+#include <uapi/linux/kdev_t.h>
 
 #ifndef bdev_kobj
 	#define bdev_kobj(_bdev) (&(disk_to_dev((_bdev)->bd_disk)->kobj))
@@ -194,8 +195,7 @@ wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->new_disk_addtl_jiff
 				lc->this_dev = atomic_read(&lc->next_dev);
 			} while (atomic_cmpxchg(&lc->next_dev, lc->this_dev, 0) != lc->this_dev);
 
-			snprintf(devname, sizeof(devname) - 1, "%u:%u", MAJOR(lc->this_dev), MINOR(lc->this_dev));
-
+			print_dev_t(devname, lc->this_dev);
 			ret = dm_get_device(ti, devname, dm_table_get_mode(ti->table), &new);
 			if (ret) {
 				pr_warn("Failed to dm_get new disk: %s with error %i\n", devname, ret);
@@ -332,11 +332,11 @@ static int add_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	disk = *(struct gendisk **)(ri->data);
 	
 	pr_warn("pre get path\n");
-	devpath = kobject_get_path(bdev_kobj(lc->dev->bdev), GFP_KERNEL);
+	devpath = kobject_get_path(bdev_kobj(g->dev->bdev), GFP_KERNEL);
 	pr_warn("after path\n");
 	
-	if (memcmp(devpath, lc->match_path, lc->match_len)) {
-		pr_warn("device is not on path: %s != %s\n", devpath, lc->match_path);
+	if (memcmp(devpath, g->match_path, g->match_len)) {
+		pr_warn("device is not on path: %s != %s\n", devpath, g->match_path);
 		goto out;
 	}
 	pr_warn("after cmp\n");
