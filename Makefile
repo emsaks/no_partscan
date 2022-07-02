@@ -1,4 +1,4 @@
-VER := 6
+VER := 0
 obj-m := dm_persist$(VER).o #no_partscan.o badbio.o biosnoop.o dm_persist.o
 dm_persist$(VER)-objs := dm_persist.o
 KDIR := /lib/modules/$(shell uname -r)/build
