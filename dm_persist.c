@@ -20,7 +20,7 @@
 #include <linux/completion.h>
 #include <uapi/linux/kdev_t.h>
 
-#define PERSIST_VER "0"
+#define PERSIST_VER "1"
 static char * holder = "dm_persist"PERSIST_VER" held disk.";
 
 #ifndef bdev_kobj
@@ -59,8 +59,11 @@ struct persist_c {
 	struct mutex io_lock;
 
 	int timed_out;
-	int io_timeout_jiffies;
-	int new_disk_addtl_jiffies;
+	uint32_t io_timeout_jiffies;
+	uint32_t new_disk_addtl_jiffies;
+
+	uint swapped_count;
+	unsigned long jiffies_when_added;
 };
 
 DEFINE_MUTEX(instance_lock);
@@ -255,13 +258,8 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 			ti->error = "Failed to plant disk probes";
 			return ret;
 		}
-	} else {
-		atomic_dec(&instances);
-		ti->error = "Mulitple instances not supported";
-		return -ENOTSUPP;
 	}
 
-	pr_warn("enter ctr\n");
 	if (argc != 3) {
 		ti->error = "Invalid argument count";
 		atomic_dec(&instances);
@@ -305,12 +303,11 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	devpath[lc->match_len] = '\0';
 	lc->match_path = devpath;
 
-	
+	lc->jiffies_when_added = jiffies;
 	lc->capacity = get_capacity(lc->blkdev->bd_disk);
 	lc->io_timeout_jiffies = 30*HZ;
 	lc->new_disk_addtl_jiffies = 30*HZ;
 	lc->this_dev = disk_devt(lc->blkdev->bd_disk);
-
 	
 	init_completion(&lc->ios_finished);
 	init_completion(&lc->disk_added);
@@ -374,7 +371,8 @@ static struct block_device * get_dev(struct dm_target *ti)
 			return NULL;
 		}
 		if (!lc->this_dev) { // cleared by disk_del
-			int jiffies = wait_for_completion_io_timeout(&lc->ios_finished, lc->io_timeout_jiffies);
+			unsigned long uptime = jiffies - lc->jiffies_when_added;
+			int io_jiffies = wait_for_completion_io_timeout(&lc->ios_finished, lc->io_timeout_jiffies);
 
 			if (!atomic_read(&lc->ios_in_flight)) {
 				if (IS_ERR(lc->blkdev)) { pr_warn("Can't free NULL device!\n"); } else
@@ -384,7 +382,7 @@ static struct block_device * get_dev(struct dm_target *ti)
 				atomic_set(&lc->ios_in_flight, 0);
 			}
 
-wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->new_disk_addtl_jiffies + jiffies)) {
+wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->new_disk_addtl_jiffies + io_jiffies)) {
 				pr_warn("Disk wait timeout\n");
 				lc->timed_out = 1;
 				mutex_unlock(&lc->io_lock);
@@ -396,6 +394,7 @@ wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->new_disk_addtl_jiff
 			} while (atomic_cmpxchg(&lc->next_dev, lc->this_dev, 0) != lc->this_dev);
 
 			lc->blkdev = blkdev_get_by_dev(lc->this_dev, dm_table_get_mode(ti->table), holder);
+			lc->jiffies_when_added = jiffies;
 			if (IS_ERR(lc->blkdev)) {
 				pr_warn("Failed to get new disk: %u with error %pe\n", lc->this_dev, lc->blkdev);
 				goto wait;
@@ -407,7 +406,11 @@ wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->new_disk_addtl_jiff
 				goto wait;
 			}
 
-			pr_warn("Added new disk %s\n", lc->blkdev->bd_disk->disk_name);
+			lc->swapped_count++;
+			pr_warn("Added new disk %s (#%i); Previous uptime: %lum%lus\n",
+				lc->blkdev->bd_disk->disk_name,
+				lc->swapped_count, 
+				uptime / (HZ*60), (uptime % (HZ*60)) / HZ);
 		}
 		atomic_inc(&lc->ios_in_flight);
 	} mutex_unlock(&lc->io_lock);
