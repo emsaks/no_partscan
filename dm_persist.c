@@ -343,7 +343,7 @@ static void persist_dtr(struct dm_target *ti)
 	struct persist_c *lc = (struct persist_c *) ti->private;
 
 	kfree(lc->match_path);
-	if (lc->blkdev) blkdev_put(lc->blkdev, dm_table_get_mode(ti->table));
+	if (!IS_ERR_OR_NULL(lc->blkdev)) blkdev_put(lc->blkdev, dm_table_get_mode(ti->table));
 
 	mutex_lock(&instance_lock);
 	list_del(&lc->node);
@@ -375,7 +375,7 @@ static struct block_device * get_dev(struct dm_target *ti)
 			int io_jiffies = wait_for_completion_io_timeout(&lc->ios_finished, lc->io_timeout_jiffies);
 
 			if (!atomic_read(&lc->ios_in_flight)) {
-				if (IS_ERR(lc->blkdev)) { pr_warn("Can't free NULL device!\n"); } else
+				if (IS_ERR_OR_NULL(lc->blkdev)) { pr_warn("Can't free NULL device!\n"); } else
 				blkdev_put(lc->blkdev, dm_table_get_mode(ti->table));
 			} else {
 				pr_warn("Forgetting %u ios_in_flight\n", atomic_read(&lc->ios_in_flight));
