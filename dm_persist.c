@@ -405,6 +405,9 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	lc->opts.disk_flags = GENHD_FL_NO_PART_SCAN;
 	lc->opts.io_timeout_jiffies = 30*HZ;
 	lc->opts.new_disk_addtl_jiffies = 60*HZ;
+
+	ret = parse_opts(ti, &lc->opts, argc - 3, &argv[3]);
+	if (ret) goto bad_path;
 	
 	init_completion(&lc->ios_finished);
 	init_completion(&lc->disk_added);
