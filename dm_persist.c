@@ -95,8 +95,16 @@ static int test_path(char * target, const char * pattern, int pattern_len)
 
 	if (strlen(target) < pattern_len)
 		return -1;
-	for (i = 0; i < pattern_len; ++i)
-		if (pattern[i] == '?') target[i] = '?';
+	if (target[pattern_len] && target[pattern_len] != '/')
+		return -1;
+	for (i = 0; i < pattern_len; ++i) {
+		if (pattern[i] == '?') {
+			if (target[i] == '/')
+				return -1;
+			target[i] = '?';
+		}
+	}
+
 	if (memcmp(target, pattern, pattern_len))
 		return -1;
 
@@ -397,12 +405,14 @@ wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->new_disk_addtl_jiff
 			lc->jiffies_when_added = jiffies;
 			if (IS_ERR(lc->blkdev)) {
 				pr_warn("Failed to get new disk: %u with error %pe\n", lc->this_dev, lc->blkdev);
+				io_jiffies = lc->io_timeout_jiffies;
 				goto wait;
 			}
 
 			if (get_capacity(lc->blkdev->bd_disk) != lc->capacity) {
 				pr_warn("New disk capacity doesn't match! Skipping.\n");
 				blkdev_put(lc->blkdev, dm_table_get_mode(ti->table));
+				io_jiffies = lc->io_timeout_jiffies;
 				goto wait;
 			}
 
