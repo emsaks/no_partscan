@@ -38,6 +38,12 @@ static char * holder = "dm_persist"PERSIST_VER" held disk.";
 /*
  * persist: maps a persistent range of a device.
  */
+
+struct persist_opts {
+	int disk_flags;
+	uint32_t io_timeout_jiffies;
+	uint32_t new_disk_addtl_jiffies;
+};
 struct persist_c {
 	struct list_head node;
 
@@ -46,24 +52,23 @@ struct persist_c {
 	struct completion disk_added;
 
 	struct block_device * blkdev;
+	sector_t start;
 	sector_t capacity;
 
 	char *	match_path;
 	int 	match_len;
 	int 	addtl_depth;
 
-	sector_t start;
-
 	atomic_t ios_in_flight;
 	struct completion ios_finished;
 	struct mutex io_lock;
 
 	int timed_out;
-	uint32_t io_timeout_jiffies;
-	uint32_t new_disk_addtl_jiffies;
 
 	uint swapped_count;
 	unsigned long jiffies_when_added;
+
+	struct persist_opts opts;
 };
 
 DEFINE_MUTEX(instance_lock);
@@ -97,6 +102,7 @@ static int test_path(char * target, const char * pattern, int pattern_len)
 		return -1;
 	if (target[pattern_len] && target[pattern_len] != '/')
 		return -1;
+
 	for (i = 0; i < pattern_len; ++i) {
 		if (pattern[i] == '?') {
 			if (target[i] == '/')
@@ -124,46 +130,96 @@ static char add_func[NAME_MAX] = "add_disk";
 static char add_func[NAME_MAX] = "device_add_disk";
 #endif
 
+struct add_data {
+	struct gendisk * disk;
+	int old_flags;
+	char * path;
+};
+
 static int add_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	*(struct gendisk **)ri->data = (struct gendisk *)regs->ARG;
+	struct gendisk * disk = (void*)regs->ARG;
+	struct add_data * d = (void*)ri->data;
+	struct persist_c * lc;
+	struct kobject * parent;
+
+	d->disk = NULL;
+
+	if (!disk) {
+		pr_warn("Disk argument is NULL!\n");
+		return 0;
+	}
+
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,7,10)
+    parent = &(disk->driverfs_dev->kobj);
+#else // driverfs_dev removed and device passed directly to the function
+    parent = &(((struct device *)(regs->ARG1))->kobj);
+#endif
+
+	if (!parent) {
+		pr_warn("Disk %s has no parent device! Skipping\n", disk->disk_name);
+		return 0;
+	}
+	d->path = kobject_get_path(parent, GFP_KERNEL);
+
+	if (!d->path) {
+		pr_warn("No path retrieved for disk %s! Skipping\n", disk->disk_name);
+		return 0;
+	}
+
+	d->old_flags = disk->flags;
+
+	mutex_lock(&instance_lock);
+	list_for_each_entry(lc, &instance_list, node) {
+		if (test_path(d->path, lc->match_path, lc->match_len) != lc->addtl_depth) {
+			pr_warn("Disk %s is not on path: %s != %s\n", disk->disk_name, d->path, lc->match_path);
+			continue;
+		}
+
+		if (get_capacity(disk) != lc->capacity) {
+			pr_warn("New disk %s capacity doesn't match! Skipping.\n", disk->disk_name);
+			continue;
+		}
+
+		disk->flags |= lc->opts.disk_flags;
+		d->disk = disk;
+	}
+	mutex_unlock(&instance_lock);
+
+	if (!d->disk) {
+		kfree(d->path);
+		d->path = NULL;
+	} else {
+		if (!(d->old_flags & GENHD_FL_NO_PART_SCAN) && (disk->flags & GENHD_FL_NO_PART_SCAN))
+			pr_warn("Suppressed partscan on disk %s\n", disk->disk_name);
+	}
+
 	return 0;
 }
 
 static int add_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct gendisk * disk;
-	char * devpath;
 	struct persist_c * lc;
+	struct add_data * d = (void*)ri->data;
+
+	if (!d->disk) return 0;
 
 	if (regs_return_value(regs))
-		return 0;
-
-	disk = *(struct gendisk **)(ri->data);
-
-	if (!disk) { pr_warn("No disk stashed!\n"); return 0; }
-	devpath = kobject_get_path(&disk_to_dev(disk)->kobj, GFP_KERNEL);
-	if (!devpath) { pr_warn("No path returned for kobj!\n"); return 0; }
+		goto out;
 
 	mutex_lock(&instance_lock);
 	list_for_each_entry(lc, &instance_list, node) {
-		if (test_path(devpath, lc->match_path, lc->match_len) != lc->addtl_depth) {
-			pr_warn("Device is not on path: %s != %s\n", devpath, lc->match_path);
-			goto out;
-		}
+		if (test_path(d->path, lc->match_path, lc->match_len) != lc->addtl_depth)
+			continue;
 
-		if (get_capacity(disk) != lc->capacity) {
-			pr_warn("New disk capacity doesn't match! Skipping.\n");
-			goto out;
-		}
-
-		pr_warn("Flagging for new disk %s\n", disk->disk_name);
-		atomic_set(&lc->next_dev, disk_devt(disk));
+		pr_warn("Flagging for new disk %s\n", d->disk->disk_name);
+		atomic_set(&lc->next_dev, disk_devt(d->disk));
 		complete(&lc->disk_added);
 	}
-out:
 	mutex_unlock(&instance_lock);
-	kfree(devpath);
+
+out:
+	kfree(d->path);
 	return 0;
 }
 
@@ -205,7 +261,7 @@ static struct kretprobe del_probe = {
 static struct kretprobe add_probe = {
     .handler        = add_ret,
     .entry_handler  = add_entry,
-    .data_size      = sizeof(struct gendisk *),
+    .data_size      = sizeof(struct add_data),
     .maxactive      = 20,
 };
 
@@ -296,7 +352,13 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad;
 	}
 
-	devpath = kobject_get_path(bdev_kobj(lc->blkdev), GFP_KERNEL);
+	if (!disk_to_dev(lc->blkdev->bd_disk)->parent) {
+		ret = -ENODEV;
+		ti->error = "No parent device found";
+		goto bad;
+	}
+
+	devpath = kobject_get_path(&(disk_to_dev(lc->blkdev->bd_disk)->parent->kobj), GFP_KERNEL);
 
 	match_path = normalize_path(argv[1]);
 	lc->match_len = strlen(match_path);
@@ -313,9 +375,11 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	lc->jiffies_when_added = jiffies;
 	lc->capacity = get_capacity(lc->blkdev->bd_disk);
-	lc->io_timeout_jiffies = 30*HZ;
-	lc->new_disk_addtl_jiffies = 30*HZ;
 	lc->this_dev = disk_devt(lc->blkdev->bd_disk);
+
+	lc->opts.disk_flags = GENHD_FL_NO_PART_SCAN;
+	lc->opts.io_timeout_jiffies = 30*HZ;
+	lc->opts.new_disk_addtl_jiffies = 30*HZ;
 	
 	init_completion(&lc->ios_finished);
 	init_completion(&lc->disk_added);
@@ -380,7 +444,7 @@ static struct block_device * get_dev(struct dm_target *ti)
 		}
 		if (!lc->this_dev) { // cleared by disk_del
 			unsigned long uptime = jiffies - lc->jiffies_when_added;
-			int io_jiffies = wait_for_completion_io_timeout(&lc->ios_finished, lc->io_timeout_jiffies);
+			int io_jiffies = wait_for_completion_io_timeout(&lc->ios_finished, lc->opts.io_timeout_jiffies);
 
 			if (!atomic_read(&lc->ios_in_flight)) {
 				if (IS_ERR_OR_NULL(lc->blkdev)) { pr_warn("Can't free NULL device!\n"); } else
@@ -390,7 +454,7 @@ static struct block_device * get_dev(struct dm_target *ti)
 				atomic_set(&lc->ios_in_flight, 0);
 			}
 
-wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->new_disk_addtl_jiffies + io_jiffies)) {
+wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->opts.new_disk_addtl_jiffies + io_jiffies)) {
 				pr_warn("Disk wait timeout\n");
 				lc->timed_out = 1;
 				mutex_unlock(&lc->io_lock);
@@ -405,14 +469,14 @@ wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->new_disk_addtl_jiff
 			lc->jiffies_when_added = jiffies;
 			if (IS_ERR(lc->blkdev)) {
 				pr_warn("Failed to get new disk: %u with error %pe\n", lc->this_dev, lc->blkdev);
-				io_jiffies = lc->io_timeout_jiffies;
+				io_jiffies = lc->opts.io_timeout_jiffies;
 				goto wait;
 			}
 
 			if (get_capacity(lc->blkdev->bd_disk) != lc->capacity) {
 				pr_warn("New disk capacity doesn't match! Skipping.\n");
 				blkdev_put(lc->blkdev, dm_table_get_mode(ti->table));
-				io_jiffies = lc->io_timeout_jiffies;
+				io_jiffies = lc->opts.io_timeout_jiffies;
 				goto wait;
 			}
 
