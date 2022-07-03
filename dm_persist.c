@@ -73,7 +73,7 @@ struct persist_c {
 
 DEFINE_MUTEX(instance_lock);
 static LIST_HEAD(instance_list);
-atomic_t instances;
+uint instances;
 
 static char * normalize_path(char * path) // allow paths retrieved from sysfs
 {
@@ -304,6 +304,41 @@ static void rip_probes(void)
 	unregister_kretprobe(&add_probe);
 }
 
+static int parse_opts(struct dm_target *ti, struct persist_opts * opts, int argc, char ** args)
+{
+	int tmp; 
+	char dummy;
+	int i;
+
+	for (i = 0; i < argc; i++) {
+		if (!strncmp(args[i], "io_timeout", 11)) {
+			if (++i == argc) goto err;
+			if (sscanf(args[i], "%u%c", &tmp, &dummy) != 1)
+				ti->error = "Bad io timeout";
+				return -ENOPARAM;
+			opts->io_timeout_jiffies = tmp*HZ;
+		} else if(!strncmp(args[i], "disk_timeout", 13)) {
+			if (++i == argc) goto err;
+			if (sscanf(args[i], "%u%c", &tmp, &dummy) != 1) {
+				ti->error = "Bad disk timeout";
+				return -ENOPARAM;
+			}
+			opts->new_disk_addtl_jiffies = tmp*HZ;
+		} else {
+			ti->error = "Unknown parameter";
+			return -ENOPARAM;
+		}
+	}
+
+	if (opts->new_disk_addtl_jiffies > opts->io_timeout_jiffies)
+		opts->new_disk_addtl_jiffies -= opts->io_timeout_jiffies;
+
+	return 0;
+err:
+	ti->error = "Missing parameter value";
+	return -ENOPARAM;
+}
+
 /*
  * Construct a persist mapping: <dev_path> <offset>
  */
@@ -316,32 +351,22 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	char * devpath;
 	char * match_path;
 
-	if (atomic_inc_return(&instances) == 1) {
-		ret = plant_probes();
-		if (ret) {
-			ti->error = "Failed to plant disk probes";
-			return ret;
-		}
-	}
-
-	if (argc != 3) {
+	if (argc < 3) {
 		ti->error = "Invalid argument count";
-		atomic_dec(&instances);
 		return -EINVAL;
 	}
 
 	lc = kmalloc(sizeof(*lc), GFP_KERNEL);
 	if (lc == NULL) {
 		ti->error = "Cannot allocate persist context";
-		atomic_dec(&instances);
 		return -ENOMEM;
 	}
 	memset(lc, 0, sizeof(*lc));
 
 	ret = -EINVAL;
-	if (sscanf(argv[2], "%llu%c", &tmp, &dummy) != 1 || tmp != (sector_t)tmp) {
+	if (sscanf(argv[1], "%llu%c", &tmp, &dummy) != 1 || tmp != (sector_t)tmp) {
 		ti->error = "Invalid device sector";
-		goto bad;
+		goto bad_instance;
 	}
 	lc->start = tmp;
 
@@ -349,25 +374,25 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	if (IS_ERR(lc->blkdev)) {
 		ret = PTR_ERR(lc->blkdev);
 		ti->error = "Device lookup failed";
-		goto bad;
+		goto bad_instance;
 	}
 
 	if (!disk_to_dev(lc->blkdev->bd_disk)->parent) {
 		ret = -ENODEV;
 		ti->error = "No parent device found";
-		goto bad;
+		goto bad_disk;
 	}
 
 	devpath = kobject_get_path(&(disk_to_dev(lc->blkdev->bd_disk)->parent->kobj), GFP_KERNEL);
 
-	match_path = normalize_path(argv[1]);
+	match_path = normalize_path(argv[2]);
 	lc->match_len = strlen(match_path);
 	lc->addtl_depth = test_path(devpath, match_path, lc->match_len);
 	if (lc->addtl_depth < 0) {
 		pr_warn("Device is not on path: %s != %s\n", devpath, argv[1]);
 		ti->error = "Device is not on provided path";
 		ret = -EBADMSG;
-		goto bad2;
+		goto bad_path;
 	}
 
 	devpath[lc->match_len] = '\0';
@@ -387,8 +412,17 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	atomic_set(&lc->ios_in_flight, 0);
 
 	INIT_LIST_HEAD(&lc->node);
+	
 	mutex_lock(&instance_lock);
 	list_add(&lc->node, &instance_list);
+	if (!instances) {
+		ret = plant_probes();
+		if (ret) {
+			ti->error = "Failed to plant disk probes";
+			goto bad_path;
+		}
+	}
+	++instances;
 	mutex_unlock(&instance_lock);
 
 	pr_warn("Finished init\n");
@@ -398,14 +432,14 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	ti->num_discard_bios = 1;
 	ti->num_secure_erase_bios = 1;
 	ti->num_write_zeroes_bios = 1;
+
 	return 0;
 
-	  bad2:
+	  bad_path:
 	kfree(devpath);
+	  bad_disk:
 	blkdev_put(lc->blkdev, dm_table_get_mode(ti->table));
-      bad:
-	if (atomic_dec_and_test(&instances))
-		rip_probes();
+      bad_instance:
 	kfree(lc);
 	return ret;
 }
@@ -419,9 +453,9 @@ static void persist_dtr(struct dm_target *ti)
 
 	mutex_lock(&instance_lock);
 	list_del(&lc->node);
-	mutex_unlock(&instance_lock);
-	if (atomic_dec_and_test(&instances))
+	if (!--instances)
 		rip_probes();
+	mutex_unlock(&instance_lock);
 	kfree(lc);
 }
 
