@@ -304,6 +304,7 @@ static void rip_probes(void)
 	unregister_kretprobe(&add_probe);
 }
 
+// call after setting  defaults
 static int parse_opts(struct dm_target *ti, struct persist_opts * opts, int argc, char ** args)
 {
 	int tmp; 
