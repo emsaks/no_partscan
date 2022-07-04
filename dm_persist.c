@@ -20,18 +20,12 @@
 #include <linux/completion.h>
 #include <uapi/linux/kdev_t.h>
 
-#define PERSIST_VER "1"
+#define PERSIST_VER "2"
 static char * holder = "dm_persist"PERSIST_VER" held disk.";
 
 #ifndef bdev_kobj
 	#define bdev_kobj(_bdev) (&(disk_to_dev((_bdev)->bd_disk)->kobj))
 #endif
-
-/*
- * Copyright (C) 2001-2003 Sistina Software (UK) Limited.
- *
- * This file is released under the GPL.
- */
 
 #define DM_MSG_PREFIX "persist"PERSIST_VER
 
@@ -306,30 +300,52 @@ static void rip_probes(void)
 }
 
 // call after setting  defaults
-static int parse_opts(struct dm_target *ti, struct persist_opts * opts, int argc, char ** args)
+static int parse_opts(struct dm_target *ti, struct persist_opts * opts, int argc, char ** argv)
 {
 	int tmp; 
 	char dummy;
 	int i;
 
 	for (i = 0; i < argc; i++) {
-		if (!strcmp(args[i], "io_timeout")) {
+		if (!strcmp(argv[i], "io_timeout")) {
 			if (++i == argc) goto err;
-			if (sscanf(args[i], "%u%c", &tmp, &dummy) != 1) {
+			if (sscanf(argv[i], "%u%c", &tmp, &dummy) != 1) {
 				ti->error = "Bad io timeout";
 				return -ENOPARAM;
 			}
+			pr_warn("Setting io timeout to %i seconds\n", tmp);
 			opts->io_timeout_jiffies = tmp*HZ;
-		} else if(!strcmp(args[i], "disk_timeout")) {
+		} else if(!strcmp(argv[i], "disk_timeout")) {
 			if (++i == argc) goto err;
-			if (sscanf(args[i], "%u%c", &tmp, &dummy) != 1) {
+			if (sscanf(argv[i], "%u%c", &tmp, &dummy) != 1) {
 				ti->error = "Bad disk timeout";
 				return -ENOPARAM;
 			}
+			pr_warn("Setting disk to %i seconds\n", tmp);
 			opts->new_disk_addtl_jiffies = tmp*HZ;
-		} else if (!strcmp(args[i], "script")) {
-
+		} else if (!strcmp(argv[i], "script")) {
+			if (++i == argc) goto err;
+			if (*argv[i] != '/') {
+				pr_warn("Script parameter requires an absolute path; won't use $s\n", argv[i]);
+				ti->error = "script parameter requires an absolute path";
+				return -ENOPARAM;
+			}
+			if (opts->script_on_added)
+				kfree(opts->script_on_added);
+			opts->script_on_added = kstrdup(argv[i], GFP_KERNEL);
+			if (!opts->script_on_added) {
+				ti->error = "Failed to allocate memory for string";
+				return -ENOMEM;
+			}
+			pr_warn("Using script at %s on disk reset\n", argv[i]);
+		} else if (!strcmp(argv[i], "partscan")) {
+			if (++i == argc) goto err;
+			if (*argv[i] == '1')
+				opts->disk_flags |= GENHD_FL_NO_PART_SCAN;
+			else
+				opts->disk_flags &= ~GENHD_FL_NO_PART_SCAN;
 		} else {
+			pr_warn("Unknown parameter %s\n", argv[i]);
 			ti->error = "Unknown parameter";
 			return -ENOPARAM;
 		}
@@ -337,6 +353,7 @@ static int parse_opts(struct dm_target *ti, struct persist_opts * opts, int argc
 
 	if (opts->new_disk_addtl_jiffies > opts->io_timeout_jiffies)
 		opts->new_disk_addtl_jiffies -= opts->io_timeout_jiffies;
+	else opts->new_disk_addtl_jiffies = 0;
 
 	return 0;
 err:
@@ -474,6 +491,23 @@ static sector_t persist_map_sector(struct dm_target *ti, sector_t bi_sector)
 	return lc->start + dm_target_offset(ti, bi_sector);
 }
 
+int try_script(struct persist_c *lc) {
+	int ret;
+	char * envp[] = { "HOME=/", NULL };
+	char * argv[] = { "/bin/bash", lc->opts.script_on_added, lc->blkdev->bd_disk->disk_name, NULL };
+
+	if (!lc->opts.script_on_added)
+		return 0;
+
+	pr_warn("Calling user script %s\n", lc->opts.script_on_added);
+
+	ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
+	if (ret) 
+		pr_warn("Script failed with error code %i\n", ret);
+
+	return ret;
+}
+
 static struct block_device * get_dev(struct dm_target *ti)
 {
 	struct persist_c *lc = ti->private;
@@ -527,6 +561,8 @@ wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->opts.new_disk_addtl
 				lc->blkdev->bd_disk->disk_name,
 				lc->swapped_count, 
 				uptime / (HZ*60), (uptime % (HZ*60)) / HZ);
+
+			try_script(lc);
 		}
 		atomic_inc(&lc->ios_in_flight);
 	} mutex_unlock(&lc->io_lock);
