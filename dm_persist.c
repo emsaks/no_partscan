@@ -40,6 +40,7 @@ static char * holder = "dm_persist"PERSIST_VER" held disk.";
  */
 
 struct persist_opts {
+	char * script_on_added;
 	int disk_flags;
 	uint32_t io_timeout_jiffies;
 	uint32_t new_disk_addtl_jiffies;
@@ -244,7 +245,7 @@ static int del_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 			pr_warn("Clearing this_dev\n");
 			lc->this_dev = 0;
 		}
-		nxt:
+		nxt:;
 	}
 	mutex_unlock(&instance_lock);
 	return 0;
@@ -312,19 +313,22 @@ static int parse_opts(struct dm_target *ti, struct persist_opts * opts, int argc
 	int i;
 
 	for (i = 0; i < argc; i++) {
-		if (!strncmp(args[i], "io_timeout", 11)) {
+		if (!strcmp(args[i], "io_timeout")) {
 			if (++i == argc) goto err;
-			if (sscanf(args[i], "%u%c", &tmp, &dummy) != 1)
+			if (sscanf(args[i], "%u%c", &tmp, &dummy) != 1) {
 				ti->error = "Bad io timeout";
 				return -ENOPARAM;
+			}
 			opts->io_timeout_jiffies = tmp*HZ;
-		} else if(!strncmp(args[i], "disk_timeout", 13)) {
+		} else if(!strcmp(args[i], "disk_timeout")) {
 			if (++i == argc) goto err;
 			if (sscanf(args[i], "%u%c", &tmp, &dummy) != 1) {
 				ti->error = "Bad disk timeout";
 				return -ENOPARAM;
 			}
 			opts->new_disk_addtl_jiffies = tmp*HZ;
+		} else if (!strcmp(args[i], "script")) {
+
 		} else {
 			ti->error = "Unknown parameter";
 			return -ENOPARAM;
