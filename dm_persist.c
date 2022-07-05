@@ -156,13 +156,13 @@ static int add_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 #endif
 
 	if (!parent) {
-		pr_warn("Disk %s has no parent device! Skipping\n", disk->disk_name);
+		pr_warn("Disk [%s] has no parent device! Skipping\n", disk->disk_name);
 		return 0;
 	}
 	d->path = kobject_get_path(parent, GFP_KERNEL);
 
 	if (!d->path) {
-		pr_warn("No path retrieved for disk %s! Skipping\n", disk->disk_name);
+		pr_warn("No path retrieved for disk [%s]! Skipping\n", disk->disk_name);
 		return 0;
 	}
 
