@@ -33,7 +33,10 @@ static char * holder = "dm_persist"PERSIST_VER" held disk.";
  * persist: maps a persistent range of a device.
  */
 
+#define lc_w(fmt, ...) pr_warn("%s"fmt, lc->prefix, ## __VA_ARGS__)
+
 struct persist_opts {
+	char * name;
 	char * script_on_added;
 	int disk_flags;
 	uint32_t io_timeout_jiffies;
@@ -41,6 +44,8 @@ struct persist_opts {
 };
 struct persist_c {
 	struct list_head node;
+
+	char * prefix;
 
 	atomic_t 	next_dev;
 	dev_t 		this_dev;
@@ -167,12 +172,12 @@ static int add_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	mutex_lock(&instance_lock);
 	list_for_each_entry(lc, &instance_list, node) {
 		if (test_path(d->path, lc->match_path, lc->match_len) != lc->addtl_depth) {
-			pr_warn("Disk %s is not on path: %s != %s\n", disk->disk_name, d->path, lc->match_path);
+			lc_w("Disk [%s] is not on path: %s != %s\n", disk->disk_name, d->path, lc->match_path);
 			continue;
 		}
 
 		if (get_capacity(disk) != lc->capacity) {
-			pr_warn("New disk %s capacity doesn't match! Skipping.\n", disk->disk_name);
+			lc_w("New disk [%s] capacity doesn't match! Skipping.\n", disk->disk_name);
 			continue;
 		}
 
@@ -207,7 +212,7 @@ static int add_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 		if (test_path(d->path, lc->match_path, lc->match_len) != lc->addtl_depth)
 			continue;
 
-		pr_warn("Flagging for new disk %s\n", d->disk->disk_name);
+		lc_w("Flagging for new disk [%s]\n", d->disk->disk_name);
 		atomic_set(&lc->next_dev, disk_devt(d->disk));
 		complete(&lc->disk_added);
 	}
@@ -231,12 +236,12 @@ static int del_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	mutex_lock(&instance_lock);
 	list_for_each_entry(lc, &instance_list, node) {
 		if (atomic_cmpxchg(&lc->next_dev, del_dev, 0) == del_dev) {
-			pr_warn("Clearing next_dev\n");
+			lc_w("Clearing next_dev\n");
 			goto nxt;
 		}
 
 		if (lc->this_dev == del_dev) {
-			pr_warn("Clearing this_dev\n");
+			lc_w("Clearing this_dev\n");
 			lc->this_dev = 0;
 		}
 		nxt:;
@@ -300,8 +305,9 @@ static void rip_probes(void)
 }
 
 // call after setting  defaults
-static int parse_opts(struct dm_target *ti, struct persist_opts * opts, int argc, char ** argv)
+static int parse_opts(struct dm_target *ti, struct persist_c * lc, int argc, char ** argv)
 {
+	struct persist_opts * opts = &lc->opts;
 	int tmp; 
 	char dummy;
 	int i;
@@ -313,7 +319,7 @@ static int parse_opts(struct dm_target *ti, struct persist_opts * opts, int argc
 				ti->error = "Bad io timeout";
 				return -ENOPARAM;
 			}
-			pr_warn("Setting io timeout to %i seconds\n", tmp);
+			lc_w("Setting io timeout to %i seconds\n", tmp);
 			opts->io_timeout_jiffies = tmp*HZ;
 		} else if(!strcmp(argv[i], "disk_timeout")) {
 			if (++i == argc) goto err;
@@ -321,31 +327,38 @@ static int parse_opts(struct dm_target *ti, struct persist_opts * opts, int argc
 				ti->error = "Bad disk timeout";
 				return -ENOPARAM;
 			}
-			pr_warn("Setting disk to %i seconds\n", tmp);
+			lc_w("Setting disk to %i seconds\n", tmp);
 			opts->new_disk_addtl_jiffies = tmp*HZ;
 		} else if (!strcmp(argv[i], "script")) {
 			if (++i == argc) goto err;
 			if (*argv[i] != '/') {
-				pr_warn("Script parameter requires an absolute path; won't use $s\n", argv[i]);
-				ti->error = "script parameter requires an absolute path";
+				lc_w("Script parameter requires an absolute path; won't use %s\n", argv[i]);
+				ti->error = "Script parameter requires an absolute path";
 				return -ENOPARAM;
 			}
-			if (opts->script_on_added)
-				kfree(opts->script_on_added);
+			kfree(opts->script_on_added);
 			opts->script_on_added = kstrdup(argv[i], GFP_KERNEL);
 			if (!opts->script_on_added) {
 				ti->error = "Failed to allocate memory for string";
 				return -ENOMEM;
 			}
-			pr_warn("Using script at %s on disk reset\n", argv[i]);
+			lc_w("Using script at %s on disk reset\n", argv[i]);
 		} else if (!strcmp(argv[i], "partscan")) {
 			if (++i == argc) goto err;
-			if (*argv[i] == '1')
+			if (*argv[i] == '0')
 				opts->disk_flags |= GENHD_FL_NO_PART_SCAN;
 			else
 				opts->disk_flags &= ~GENHD_FL_NO_PART_SCAN;
+		} else if (!strcmp(argv[i], "name")) {
+			if (++i == argc) goto err;
+			kfree(lc->prefix);
+			lc->prefix = kasprintf(GFP_KERNEL, "[%s] ", argv[i]);
+			if (!lc->prefix) {
+				ti->error = "Failed to allocate memory for string";
+				return -ENOMEM;
+			}
 		} else {
-			pr_warn("Unknown parameter %s\n", argv[i]);
+			lc_w("Unknown parameter %s\n", argv[i]);
 			ti->error = "Unknown parameter";
 			return -ENOPARAM;
 		}
@@ -428,7 +441,8 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	lc->opts.io_timeout_jiffies = 30*HZ;
 	lc->opts.new_disk_addtl_jiffies = 60*HZ;
 
-	ret = parse_opts(ti, &lc->opts, argc - 3, &argv[3]);
+	if (!lc->prefix) lc->prefix = kcalloc(1, 1, GFP_KERNEL); // emptry string for no name
+	ret = parse_opts(ti, lc, argc - 3, &argv[3]);
 	if (ret) goto bad_path;
 	
 	init_completion(&lc->ios_finished);
@@ -473,14 +487,16 @@ static void persist_dtr(struct dm_target *ti)
 {
 	struct persist_c *lc = (struct persist_c *) ti->private;
 
-	kfree(lc->match_path);
-	if (!IS_ERR_OR_NULL(lc->blkdev)) blkdev_put(lc->blkdev, dm_table_get_mode(ti->table));
-
 	mutex_lock(&instance_lock);
 	list_del(&lc->node);
 	if (!--instances)
 		rip_probes();
 	mutex_unlock(&instance_lock);
+
+	kfree(lc->match_path);
+	if (!IS_ERR_OR_NULL(lc->blkdev)) blkdev_put(lc->blkdev, dm_table_get_mode(ti->table));
+	kfree(lc->opts.script_on_added);
+	kfree(lc->prefix);
 	kfree(lc);
 }
 
@@ -499,11 +515,11 @@ int try_script(struct persist_c *lc) {
 	if (!lc->opts.script_on_added)
 		return 0;
 
-	pr_warn("Calling user script %s\n", lc->opts.script_on_added);
+	lc_w("Calling user script %s\n", lc->opts.script_on_added);
 
 	ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
 	if (ret) 
-		pr_warn("Script failed with error code %i\n", ret);
+		lc_w("Script failed with error code %i\n", ret);
 
 	return ret;
 }
@@ -514,7 +530,7 @@ static struct block_device * get_dev(struct dm_target *ti)
 
 	mutex_lock(&lc->io_lock); {
 		if (lc->timed_out) {
-			pr_warn("Fast timeout\n");
+			lc_w("Fast timeout\n");
 			mutex_unlock(&lc->io_lock);
 			return NULL;
 		}
@@ -523,15 +539,15 @@ static struct block_device * get_dev(struct dm_target *ti)
 			int io_jiffies = wait_for_completion_io_timeout(&lc->ios_finished, lc->opts.io_timeout_jiffies);
 
 			if (!atomic_read(&lc->ios_in_flight)) {
-				if (IS_ERR_OR_NULL(lc->blkdev)) { pr_warn("Can't free NULL device!\n"); } else
+				if (IS_ERR_OR_NULL(lc->blkdev)) { lc_w("Can't free NULL device!\n"); } else
 				blkdev_put(lc->blkdev, dm_table_get_mode(ti->table));
 			} else {
-				pr_warn("Forgetting %u ios_in_flight\n", atomic_read(&lc->ios_in_flight));
+				lc_w("Forgetting %u ios_in_flight\n", atomic_read(&lc->ios_in_flight));
 				atomic_set(&lc->ios_in_flight, 0);
 			}
 
 wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->opts.new_disk_addtl_jiffies + io_jiffies)) {
-				pr_warn("Disk wait timeout\n");
+				lc_w("Disk wait timeout\n");
 				lc->timed_out = 1;
 				mutex_unlock(&lc->io_lock);
 				return NULL;
@@ -544,20 +560,22 @@ wait:		if (!wait_for_completion_timeout(&lc->disk_added, lc->opts.new_disk_addtl
 			lc->blkdev = blkdev_get_by_dev(lc->this_dev, dm_table_get_mode(ti->table), holder);
 			lc->jiffies_when_added = jiffies;
 			if (IS_ERR(lc->blkdev)) {
-				pr_warn("Failed to get new disk: %u with error %pe\n", lc->this_dev, lc->blkdev);
+				lc_w("Failed to get new disk: %u with error %pe\n", lc->this_dev, lc->blkdev);
 				io_jiffies = lc->opts.io_timeout_jiffies;
 				goto wait;
 			}
 
+			// todo: do we need to check path again?
+
 			if (get_capacity(lc->blkdev->bd_disk) != lc->capacity) {
-				pr_warn("New disk capacity doesn't match! Skipping.\n");
+				lc_w("New disk [%s] capacity doesn't match! Skipping.\n", lc->blkdev->bd_disk->disk_name);
 				blkdev_put(lc->blkdev, dm_table_get_mode(ti->table));
 				io_jiffies = lc->opts.io_timeout_jiffies;
 				goto wait;
 			}
 
 			lc->swapped_count++;
-			pr_warn("Added new disk %s (#%i); Previous uptime: %lum%lus\n",
+			lc_w("Added new disk [%s] (#%i); Previous uptime: %lum%lus\n",
 				lc->blkdev->bd_disk->disk_name,
 				lc->swapped_count, 
 				uptime / (HZ*60), (uptime % (HZ*60)) / HZ);
