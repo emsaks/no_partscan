@@ -33,10 +33,9 @@ static char * holder = "dm_persist"PERSIST_VER" held disk.";
  * persist: maps a persistent range of a device.
  */
 
-#define lc_w(fmt, ...) pr_warn("%s"fmt, lc->prefix, ## __VA_ARGS__)
+#define lc_w(fmt, ...) pr_warn("[%s] "fmt, lc->name, ## __VA_ARGS__)
 
 struct persist_opts {
-	char * name;
 	char * script_on_added;
 	int disk_flags;
 	uint32_t io_timeout_jiffies;
@@ -45,7 +44,7 @@ struct persist_opts {
 struct persist_c {
 	struct list_head node;
 
-	char * prefix;
+	char * name;
 
 	atomic_t 	next_dev;
 	dev_t 		this_dev;
@@ -349,14 +348,6 @@ static int parse_opts(struct dm_target *ti, struct persist_c * lc, int argc, cha
 				opts->disk_flags |= GENHD_FL_NO_PART_SCAN;
 			else
 				opts->disk_flags &= ~GENHD_FL_NO_PART_SCAN;
-		} else if (!strcmp(argv[i], "name")) {
-			if (++i == argc) goto err;
-			kfree(lc->prefix);
-			lc->prefix = kasprintf(GFP_KERNEL, "[%s] ", argv[i]);
-			if (!lc->prefix) {
-				ti->error = "Failed to allocate memory for string";
-				return -ENOMEM;
-			}
 		} else {
 			lc_w("Unknown parameter %s\n", argv[i]);
 			ti->error = "Unknown parameter";
@@ -385,6 +376,7 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	int ret;
 	char * devpath;
 	char * match_path;
+	struct mapped_device * md;
 
 	if (argc < 3) {
 		ti->error = "Invalid argument count";
@@ -433,6 +425,11 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	devpath[lc->match_len] = '\0';
 	lc->match_path = devpath;
 
+	md = dm_table_get_md(ti->table);
+	lc->name = kmalloc(DM_NAME_LEN+1, GFP_KERNEL);
+	lc->name[0] = '\0';
+	dm_copy_name_and_uuid(md, lc->name, NULL);
+
 	lc->jiffies_when_added = jiffies;
 	lc->capacity = get_capacity(lc->blkdev->bd_disk);
 	lc->this_dev = disk_devt(lc->blkdev->bd_disk);
@@ -441,7 +438,7 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	lc->opts.io_timeout_jiffies = 30*HZ;
 	lc->opts.new_disk_addtl_jiffies = 60*HZ;
 
-	if (!lc->prefix) lc->prefix = kcalloc(1, 1, GFP_KERNEL); // emptry string for no name
+	if (!lc->name) lc->name = kcalloc(1, 1, GFP_KERNEL); // emptry string for no name
 	ret = parse_opts(ti, lc, argc - 3, &argv[3]);
 	if (ret) goto bad_path;
 	
@@ -493,10 +490,10 @@ static void persist_dtr(struct dm_target *ti)
 		rip_probes();
 	mutex_unlock(&instance_lock);
 
-	kfree(lc->match_path);
 	if (!IS_ERR_OR_NULL(lc->blkdev)) blkdev_put(lc->blkdev, dm_table_get_mode(ti->table));
+	kfree(lc->match_path);
 	kfree(lc->opts.script_on_added);
-	kfree(lc->prefix);
+	kfree(lc->name);
 	kfree(lc);
 }
 
