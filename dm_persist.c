@@ -20,7 +20,7 @@
 #include <linux/completion.h>
 #include <uapi/linux/kdev_t.h>
 
-#define PERSIST_VER "2"
+#define PERSIST_VER "1"
 static char * holder = "dm_persist"PERSIST_VER" held disk.";
 
 #ifndef bdev_kobj
@@ -507,7 +507,7 @@ static sector_t persist_map_sector(struct dm_target *ti, sector_t bi_sector)
 int try_script(struct persist_c *pc) {
 	int ret;
 	char * envp[] = { "HOME=/", NULL };
-	char * argv[] = { "/bin/bash", pc->opts.script_on_added, pc->blkdev->bd_disk->disk_name, NULL };
+	char * argv[] = { "/bin/bash", pc->opts.script_on_added, pc->name, pc->blkdev->bd_disk->disk_name, NULL };
 
 	if (!pc->opts.script_on_added)
 		return 0;
@@ -536,8 +536,10 @@ static struct block_device * get_dev(struct dm_target *ti)
 			int io_jiffies = wait_for_completion_io_timeout(&pc->ios_finished, pc->opts.io_timeout_jiffies);
 
 			if (!atomic_read(&pc->ios_in_flight)) {
-				if (IS_ERR_OR_NULL(pc->blkdev)) { pw("Can't free NULL device!\n"); } else
-				blkdev_put(pc->blkdev, dm_table_get_mode(ti->table));
+				if (IS_ERR_OR_NULL(pc->blkdev)) { pw("Can't free NULL device!\n"); } else {
+					blkdev_put(pc->blkdev, dm_table_get_mode(ti->table));
+					pc->blkdev = NULL;
+				}
 			} else {
 				pw("Forgetting %u ios_in_flight\n", atomic_read(&pc->ios_in_flight));
 				atomic_set(&pc->ios_in_flight, 0);
@@ -567,6 +569,7 @@ wait:		if (!wait_for_completion_timeout(&pc->disk_added, pc->opts.new_disk_addtl
 			if (get_capacity(pc->blkdev->bd_disk) != pc->capacity) {
 				pw("New disk [%s] capacity doesn't match! Skipping.\n", pc->blkdev->bd_disk->disk_name);
 				blkdev_put(pc->blkdev, dm_table_get_mode(ti->table));
+				pc->blkdev = NULL;
 				io_jiffies = pc->opts.io_timeout_jiffies;
 				goto wait;
 			}
@@ -587,8 +590,6 @@ wait:		if (!wait_for_completion_timeout(&pc->disk_added, pc->opts.new_disk_addtl
 
 static int persist_map(struct dm_target *ti, struct bio *bio)
 {
-	//struct persist_c *pc = ti->private;
-
 	struct block_device * dev = get_dev(ti);
 	if (!dev) return DM_MAPIO_KILL;
 
@@ -596,31 +597,6 @@ static int persist_map(struct dm_target *ti, struct bio *bio)
 	bio->bi_iter.bi_sector = persist_map_sector(ti, bio->bi_iter.bi_sector);
 
 	return DM_MAPIO_REMAPPED;
-}
-
-static void persist_status(struct dm_target *ti, status_type_t type,
-			  unsigned status_flags, char *result, unsigned maxlen)
-{
-	//struct persist_c *pc = (struct persist_c *) ti->private;
-	size_t sz = 0;
-
-	switch (type) {
-	case STATUSTYPE_INFO:
-		result[0] = '\0';
-		break;
-
-	case STATUSTYPE_TABLE:
-		//DMEMIT("%s %llu", pc->dev->name, (unsigned long long)pc->start);
-		break;
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,15,0)
-	case STATUSTYPE_IMA:
-		DMEMIT_TARGET_NAME_VERSION(ti->type);
-		//DMEMIT(",device_name=%s,start=%llu;", pc->dev->name,
-		//       (unsigned long long)pc->start);
-		break;
-#endif
-	}
 }
 
 static int persist_endio(struct dm_target *ti, struct bio *bio, blk_status_t *error)
@@ -650,7 +626,6 @@ static struct target_type persist_target = {
 	.dtr    = persist_dtr,
 	.map    = persist_map,
 	.end_io = persist_endio,
-	.status = persist_status,
 };
 
 int __init dm_persist_init(void)
