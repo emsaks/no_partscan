@@ -1,0 +1,122 @@
+todos:
+		test resume etc
+		TEST arguments for timeouts etc.
+		target messages:
+			wipe
+			disk [path]
+			wake / quit
+	
+		ntmap should output bitmap map
+		make use of ntfuse
+			- implement dir lookups in ntfuse
+			- ntgrep *.jpg etc for use with find -
+		'reset' function: ddrescuelog -c '-','?' -m dom/* *.map (provide list of maps / allow all)
+		
+struct p_dev {
+	int ios_in_flight;
+	struct block_device * bdev;
+};
+
+-------------------------------------- // bio_map
+lock()
+if bd->dev = NULL; or increment
+unlock()
+if null, wait();
+wait();
+
+-------------------------------------- // disk_add
+new_bd = open_bdev;
+rollback = 0;
+lock() // we don't need lock for DEL b/c we have instance lock, but we need it to block bio_map, compete with bio_end
+		// if so, we don't need rollback; just clear bd->bdev, and set it while we have instance lock
+		// but it seems like this way is more efficient
+if (pc->seq > disk->diskseq) {
+	rollback = 1;
+} else {
+	pc->seq = disk->diskseq;
+	if (!bd->ios_in_flight) {
+		old_bd = bd->bdev;
+		bd->bdev = new_bd;
+	} else {
+		lc->spare_pd->bdev = new_bd;
+		list_insert(lc->spare_pd, &lc->pdev_list);
+	}
+}
+unlock();
+
+if (rollback) {
+	bdev_put(bd);
+	return 0;
+}
+
+if (old_bd) {
+	bdev_put(old_bd);
+} else {
+	wake_all(disk_added);
+	reset()?
+	lc->spare_pd = kmalloc();
+	lc->spare_pd->ios_in_flight = 0;
+}
+
+
+aron lipa :: about a week
+
+--------------------------------------
+
+-----------------------------// disk_del
+lock()
+update pc->seq
+if was > seq, break;
+foreach
+if (dev == dev)
+	if (!read())
+		n2 = n;
+		list_remove(n)
+	else
+		->free = 1;
+	break;
+unlock()
+if (n2) bdev_put, free(n2);
+
+alternative:
+->free = 1;
+if (!->ios_in_flight)
+	if (cmpxchg(1, 2) == 1)
+		put, free
+
+----------------------------// bio_finish
+lock ()
+foreach
+if (dev == dev) {
+	if (dec_and_test()) {
+		if(n->free) {
+			n2 = n;
+			list_remove(n)
+		}
+	}
+	break;
+}
+unlock()
+
+if (n2) bdev_put, free(n2)
+
+alternative:
+read_lock_rcu()
+...
+if (dec_and_test() && ->free)
+	put = (cmpxchg(1, 2) == 1);
+...
+read_unlock_rcu()
+
+if (put) {
+	put;
+	lock()
+		rcu_delete();
+	unlock();
+	rcu_syncronize()
+	kfree();
+}
+
+
+
+
