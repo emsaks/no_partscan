@@ -43,7 +43,7 @@ struct persist_opts {
 };
 struct persist_c {
 	struct kretprobe add_probe, del_probe;
-	char * name;
+	char name[DM_NAME_LEN+1];
 
 	atomic_t 	next_dev;
 	dev_t 		this_dev;
@@ -210,8 +210,8 @@ static int plant_probe(struct kretprobe * probe, kretprobe_handler_t entry, kret
 
 	e = register_kretprobe(probe);
     if (e < 0) {
-        pr_warn("register_kretprobe for %s failed, returned %d\n", symbol_name, ret);
-        return ret;
+        pr_warn("register_kretprobe for %s failed, returned %d\n", symbol_name, e);
+        return e;
     }
 
 	return 0;
@@ -365,8 +365,6 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	pc->path_pattern = devpath;
 
 	md = dm_table_get_md(ti->table);
-	pc->name = kmalloc(DM_NAME_LEN+1, GFP_KERNEL);
-	pc->name[0] = '\0';
 	dm_copy_name_and_uuid(md, pc->name, NULL);
 
 	pc->jiffies_when_added = jiffies;
@@ -377,7 +375,6 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	pc->opts.io_timeout_jiffies = 30*HZ;
 	pc->opts.new_disk_addtl_jiffies = 60*HZ;
 
-	if (!pc->name) pc->name = kcalloc(1, 1, GFP_KERNEL); // emptry string for no name
 	ret = parse_opts(ti, pc, argc - 3, &argv[3]);
 	if (ret) goto bad_path;
 	
@@ -421,7 +418,6 @@ static void persist_dtr(struct dm_target *ti)
 	kfree(pc->path_pattern);
 	kfree(pc->opts.script_on_added);
 	pw("Finishing destructor\n");
-	kfree(pc->name);
 	kfree(pc);
 }
 

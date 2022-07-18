@@ -44,7 +44,7 @@ struct persist_opts {
 struct persist_c {
 	struct list_head node;
 
-	char * name;
+	char name[DM_NAME_LEN+1];
 
 	atomic_t 	next_dev;
 	dev_t 		this_dev;
@@ -417,8 +417,6 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	pc->match_path = devpath;
 
 	md = dm_table_get_md(ti->table);
-	pc->name = kmalloc(DM_NAME_LEN+1, GFP_KERNEL);
-	pc->name[0] = '\0';
 	dm_copy_name_and_uuid(md, pc->name, NULL);
 
 	pc->jiffies_when_added = jiffies;
@@ -429,7 +427,6 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	pc->opts.io_timeout_jiffies = 30*HZ;
 	pc->opts.new_disk_addtl_jiffies = 60*HZ;
 
-	if (!pc->name) pc->name = kcalloc(1, 1, GFP_KERNEL); // emptry string for no name
 	ret = parse_opts(ti, pc, argc - 3, &argv[3]);
 	if (ret) goto bad_path;
 	
@@ -484,7 +481,6 @@ static void persist_dtr(struct dm_target *ti)
 	if (!IS_ERR_OR_NULL(pc->blkdev)) blkdev_put(pc->blkdev, dm_table_get_mode(ti->table));
 	kfree(pc->match_path);
 	kfree(pc->opts.script_on_added);
-	kfree(pc->name);
 	kfree(pc);
 }
 
