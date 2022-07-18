@@ -53,8 +53,7 @@ struct persist_c {
 	sector_t start;
 	sector_t capacity;
 
-	char *	match_path;
-	int 	match_len;
+	char *	path_pattern;
 	int 	addtl_depth;
 
 	atomic_t ios_in_flight;
@@ -142,8 +141,8 @@ static int add_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 	d->old_flags = disk->flags;
 
-	if (test_path(parent, pc->match_path, pc->addtl_depth)) {
-		pw("Disk [%s] is not on path: %s\n", disk->disk_name, pc->match_path);
+	if (test_path(parent, pc->path_pattern, pc->addtl_depth)) {
+		pw("Disk [%s] is not on path: %s\n", disk->disk_name, pc->path_pattern);
 	} else if (get_capacity(disk) != pc->capacity) {
 		pw("New disk [%s] capacity doesn't match! Skipping.\n", disk->disk_name);
 	} else {
@@ -198,36 +197,33 @@ static int del_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 static int del_ret(struct kretprobe_instance *ri, struct pt_regs *regs) { return 0; }
 
+static int plant_probe(struct kretprobe * probe, kretprobe_handler_t entry, kretprobe_handler_t ret, char * symbol_name, size_t data_size)
+{
+	int e;
+
+	memset(probe, 0, sizeof(*probe));
+	probe->handler        = ret,
+    probe->entry_handler  = entry,
+    probe->maxactive      = 20,
+	probe->data_size	  = data_size;
+	probe->kp.symbol_name = symbol_name;
+
+	e = register_kretprobe(probe);
+    if (e < 0) {
+        pr_warn("register_kretprobe for %s failed, returned %d\n", symbol_name, ret);
+        return ret;
+    }
+
+	return 0;
+}
 static int plant_probes(struct kretprobe * add_probe, struct kretprobe * del_probe)
 {
-	int ret;
-
-	memset(&del_probe, 0, sizeof(del_probe));
-	del_probe->handler        = del_ret,
-    del_probe->entry_handler  = del_entry,
-    del_probe->maxactive      = 20,
-	del_probe->kp.symbol_name = "del_gendisk";
-
-	ret = register_kretprobe(del_probe);
-    if (ret < 0) {
-        pr_warn("register_kretprobe for del_probe failed, returned %d\n", ret);
-        return ret;
-    }
-
-	memset(&add_probe, 0, sizeof(add_probe));
-	add_probe->handler        = add_ret,
-    add_probe->entry_handler  = add_entry,
-    add_probe->data_size      = sizeof(struct add_data),
-    add_probe->maxactive      = 20,
-	add_probe->kp.symbol_name = add_func;
-
-	ret = register_kretprobe(add_probe);
-    if (ret < 0) {
-        pr_warn("register_kretprobe for add_probe failed, returned %d\n", ret);
+	if (plant_probe(del_probe, del_entry, del_ret, "del_gendisk", 0)) return -1;
+	if (plant_probe(add_probe, add_entry, add_ret, add_func, sizeof(struct add_data))) {
 		unregister_kretprobe(del_probe);
-        return ret;
-    }
-
+		return -1;
+	}
+	
 	return 0;
 }
 
@@ -366,7 +362,7 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	while (*kp) if (*kp++ == '/') pc->addtl_depth++;
 	*kt = '\0';
 
-	pc->match_path = devpath;
+	pc->path_pattern = devpath;
 
 	md = dm_table_get_md(ti->table);
 	pc->name = kmalloc(DM_NAME_LEN+1, GFP_KERNEL);
@@ -422,8 +418,9 @@ static void persist_dtr(struct dm_target *ti)
 	rip_probes(&pc->add_probe, &pc->del_probe);
 
 	if (!IS_ERR_OR_NULL(pc->blkdev)) blkdev_put(pc->blkdev, dm_table_get_mode(ti->table));
-	kfree(pc->match_path);
+	kfree(pc->path_pattern);
 	kfree(pc->opts.script_on_added);
+	pw("Finishing destructor\n");
 	kfree(pc->name);
 	kfree(pc);
 }

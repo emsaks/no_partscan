@@ -274,7 +274,7 @@ static int plant_probes(void)
 	memset(&add_probe, 0, sizeof(add_probe));
 	add_probe.handler        = add_ret,
     add_probe.entry_handler  = add_entry,
-    add_probe.data_size      = sizeof(struct add_data),,
+    add_probe.data_size      = sizeof(struct add_data),
     add_probe.maxactive      = 20,
 	add_probe.kp.symbol_name = add_func;
 
