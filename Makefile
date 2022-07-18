@@ -1,5 +1,5 @@
 VER := 1
-obj-m := dm_persist$(VER).o no_partscan.o badbio.o biosnoop.o
+obj-m := dm_persist$(VER).o dm_persist_b.o # no_partscan.o badbio.o  biosnoop.o 
 dm_persist$(VER)-objs := dm_persist.o
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)

@@ -42,8 +42,7 @@ struct persist_opts {
 	uint32_t new_disk_addtl_jiffies;
 };
 struct persist_c {
-	struct list_head node;
-
+	struct kretprobe add_probe, del_probe;
 	char * name;
 
 	atomic_t 	next_dev;
@@ -70,10 +69,6 @@ struct persist_c {
 	struct persist_opts opts;
 };
 
-DEFINE_MUTEX(instance_lock);
-static LIST_HEAD(instance_list);
-uint instances;
-
 static char * normalize_path(char * path) // allow paths retrieved from sysfs
 {
     if (!strncmp(path, "/sys/", 5)) return path + 4;
@@ -84,39 +79,25 @@ static char * normalize_path(char * path) // allow paths retrieved from sysfs
     return path;
 }
 
-/**
- * @brief test 'target' for 'pattern'
- * 
- * @param target will be modified
- * @param pattern 
- * @param pattern_len 
- * @return int negative on failure, additional '/' in target on success
- */
-static int test_path(char * target, const char * pattern, int pattern_len)
+static int test_path(struct kobject * kobj, const char * pattern, int rewind)
 {
-	int i;
-	int depth = 0;
+	const char * part, * pp, * kp;
 
-	if (strlen(target) < pattern_len)
-		return -1;
-	if (target[pattern_len] && target[pattern_len] != '/')
-		return -1;
+	if (!kobj) return 1;
+	while (rewind--) if (!(kobj = kobj->parent)) return 1;
 
-	for (i = 0; i < pattern_len; ++i) {
-		if (pattern[i] == '?') {
-			if (target[i] == '/')
-				return -1;
-			target[i] = '?';
-		}
-	}
+	part = pattern + strlen(pattern); 
+	do {
+		part -= strlen(kobj->name) + 1;
+		if (part < pattern || *part != '/')
+			return 1;
 
-	if (memcmp(target, pattern, pattern_len))
-		return -1;
+		for (kp = kobj->name, pp = part+1; *kp; ++kp, ++pp)
+			if ((*kp != *pp) && (*pp != '?'))
+				return 1;
+	} while ((kobj = kobj->parent));
 
-	for (i = pattern_len; target[i] != '\0'; ++i)
-		if (target[i] == '/') depth++;
-
-	return depth;
+	return part != pattern;
 }
 
 #include "regs.h"
@@ -132,14 +113,13 @@ static char add_func[NAME_MAX] = "device_add_disk";
 struct add_data {
 	struct gendisk * disk;
 	int old_flags;
-	char * path;
 };
 
 static int add_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct gendisk * disk = (void*)regs->ARG;
 	struct add_data * d = (void*)ri->data;
-	struct persist_c * pc;
+	struct persist_c * pc = container_of(ri->rp, struct persist_c, add_probe);
 	struct kobject * parent;
 
 	d->disk = NULL;
@@ -159,37 +139,18 @@ static int add_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 		pr_warn("Disk [%s] has no parent device! Skipping\n", disk->disk_name);
 		return 0;
 	}
-	d->path = kobject_get_path(parent, GFP_KERNEL);
-
-	if (!d->path) {
-		pr_warn("No path retrieved for disk [%s]! Skipping\n", disk->disk_name);
-		return 0;
-	}
 
 	d->old_flags = disk->flags;
 
-	mutex_lock(&instance_lock);
-	list_for_each_entry(pc, &instance_list, node) {
-		if (test_path(d->path, pc->match_path, pc->match_len) != pc->addtl_depth) {
-			pw("Disk [%s] is not on path: %s != %s\n", disk->disk_name, d->path, pc->match_path);
-			continue;
-		}
-
-		if (get_capacity(disk) != pc->capacity) {
-			pw("New disk [%s] capacity doesn't match! Skipping.\n", disk->disk_name);
-			continue;
-		}
-
+	if (test_path(parent, pc->match_path, pc->addtl_depth)) {
+		pw("Disk [%s] is not on path: %s\n", disk->disk_name, pc->match_path);
+	} else if (get_capacity(disk) != pc->capacity) {
+		pw("New disk [%s] capacity doesn't match! Skipping.\n", disk->disk_name);
+	} else {
 		disk->flags |= pc->opts.disk_flags;
 		d->disk = disk;
-	}
-	mutex_unlock(&instance_lock);
 
-	if (!d->disk) {
-		kfree(d->path);
-		d->path = NULL;
-	} else {
-		if (!(d->old_flags & GENHD_FL_NO_PART_SCAN) && (disk->flags & GENHD_FL_NO_PART_SCAN))
+		if ((d->old_flags ^ disk->flags) & GENHD_FL_NO_PART_SCAN)
 			pr_warn("Suppressed partscan on disk %s\n", disk->disk_name);
 	}
 
@@ -198,27 +159,20 @@ static int add_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 static int add_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct persist_c * pc;
+	struct persist_c * pc = container_of(ri->rp, struct persist_c, add_probe);
 	struct add_data * d = (void*)ri->data;
 
 	if (!d->disk) return 0;
 
 	if (regs_return_value(regs))
-		goto out;
+		return 0;
 
-	mutex_lock(&instance_lock);
-	list_for_each_entry(pc, &instance_list, node) {
-		if (test_path(d->path, pc->match_path, pc->match_len) != pc->addtl_depth)
-			continue;
+	pw("Flagging for new disk [%s]\n", d->disk->disk_name);
+	atomic_set(&pc->next_dev, disk_devt(d->disk));
+	complete(&pc->disk_added);
 
-		pw("Flagging for new disk [%s]\n", d->disk->disk_name);
-		atomic_set(&pc->next_dev, disk_devt(d->disk));
-		complete(&pc->disk_added);
-	}
-	mutex_unlock(&instance_lock);
+	// todo: restore flags?
 
-out:
-	kfree(d->path);
 	return 0;
 }
 
@@ -226,72 +180,61 @@ static int del_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	dev_t del_dev;
 	struct gendisk * disk = (struct gendisk *)regs->ARG1;
-	struct persist_c * pc;
+	struct persist_c * pc = container_of(ri->rp, struct persist_c, del_probe);
 
 	if (IS_ERR_OR_NULL(disk)) { pr_warn("Deleted disk is NULL\n"); return 0; }
 
 	del_dev = disk_devt(disk);
 
-	mutex_lock(&instance_lock);
-	list_for_each_entry(pc, &instance_list, node) {
-		if (atomic_cmpxchg(&pc->next_dev, del_dev, 0) == del_dev) {
-			pw("Clearing next_dev\n");
-			goto nxt;
-		}
-
-		if (pc->this_dev == del_dev) {
-			pw("Clearing this_dev\n");
-			pc->this_dev = 0;
-		}
-		nxt:;
+	if (atomic_cmpxchg(&pc->next_dev, del_dev, 0) == del_dev) {
+		pw("Cleared next_dev\n");
+	} else if (pc->this_dev == del_dev) {
+		pw("Clearing this_dev\n");
+		pc->this_dev = 0;
 	}
-	mutex_unlock(&instance_lock);
+
 	return 0;
 }
 
 static int del_ret(struct kretprobe_instance *ri, struct pt_regs *regs) { return 0; }
 
-static struct kretprobe del_probe;
-
-static struct kretprobe add_probe;
-
-static int plant_probes(void)
+static int plant_probes(struct kretprobe * add_probe, struct kretprobe * del_probe)
 {
 	int ret;
 
 	memset(&del_probe, 0, sizeof(del_probe));
-	del_probe.handler        = del_ret,
-    del_probe.entry_handler  = del_entry,
-    del_probe.maxactive      = 20,
-	del_probe.kp.symbol_name = "del_gendisk";
+	del_probe->handler        = del_ret,
+    del_probe->entry_handler  = del_entry,
+    del_probe->maxactive      = 20,
+	del_probe->kp.symbol_name = "del_gendisk";
 
-	ret = register_kretprobe(&del_probe);
+	ret = register_kretprobe(del_probe);
     if (ret < 0) {
         pr_warn("register_kretprobe for del_probe failed, returned %d\n", ret);
         return ret;
     }
 
 	memset(&add_probe, 0, sizeof(add_probe));
-	add_probe.handler        = add_ret,
-    add_probe.entry_handler  = add_entry,
-    add_probe.data_size      = sizeof(struct add_data),,
-    add_probe.maxactive      = 20,
-	add_probe.kp.symbol_name = add_func;
+	add_probe->handler        = add_ret,
+    add_probe->entry_handler  = add_entry,
+    add_probe->data_size      = sizeof(struct add_data),
+    add_probe->maxactive      = 20,
+	add_probe->kp.symbol_name = add_func;
 
-	ret = register_kretprobe(&add_probe);
+	ret = register_kretprobe(add_probe);
     if (ret < 0) {
         pr_warn("register_kretprobe for add_probe failed, returned %d\n", ret);
-		unregister_kretprobe(&del_probe);
+		unregister_kretprobe(del_probe);
         return ret;
     }
 
 	return 0;
 }
 
-static void rip_probes(void)
+static void rip_probes(struct kretprobe * add_probe, struct kretprobe * del_probe)
 {
-	unregister_kretprobe(&del_probe);
-	unregister_kretprobe(&add_probe);
+	unregister_kretprobe(add_probe);
+	unregister_kretprobe(del_probe);
 }
 
 // call after setting  defaults
@@ -366,7 +309,8 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	char dummy;
 	int ret;
 	char * devpath;
-	char * match_path;
+	char * pattern;
+	char *kp, *pp, *kt;
 	struct mapped_device * md;
 
 	if (argc < 3) {
@@ -402,18 +346,26 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	devpath = kobject_get_path(&(disk_to_dev(pc->blkdev->bd_disk)->parent->kobj), GFP_KERNEL);
+	pattern = normalize_path(argv[2]);
 
-	match_path = normalize_path(argv[2]);
-	pc->match_len = strlen(match_path);
-	pc->addtl_depth = test_path(devpath, match_path, pc->match_len);
-	if (pc->addtl_depth < 0) {
+	for (kp = devpath, pp = pattern; *kp; ++kp, ++pp) {
+		if (*kp != *pp) {
+			if (*pp != '?' || *kp == '/') break;
+			*kp = '?';
+		}
+	}
+
+	if (*pp || (*kp && *kp != '/')) { // this will exclude trailing '/' in pattern
 		pr_warn("Device is not on path: %s != %s\n", devpath, argv[1]);
 		ti->error = "Device is not on provided path";
 		ret = -EBADMSG;
 		goto bad_path;
 	}
 
-	devpath[pc->match_len] = '\0';
+	kt = kp;
+	while (*kp) if (*kp++ == '/') pc->addtl_depth++;
+	*kt = '\0';
+
 	pc->match_path = devpath;
 
 	md = dm_table_get_md(ti->table);
@@ -438,19 +390,11 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	mutex_init(&pc->io_lock);
 	atomic_set(&pc->ios_in_flight, 0);
 
-	INIT_LIST_HEAD(&pc->node);
-	
-	mutex_lock(&instance_lock);
-	list_add(&pc->node, &instance_list);
-	if (!instances) {
-		ret = plant_probes();
-		if (ret) {
-			ti->error = "Failed to plant disk probes";
-			goto bad_path;
-		}
+	ret = plant_probes(&pc->add_probe, &pc->del_probe);
+	if (ret) {
+		ti->error = "Failed to plant disk probes";
+		goto bad_path;
 	}
-	++instances;
-	mutex_unlock(&instance_lock);
 
 	pr_warn("Finished init\n");
 
@@ -475,11 +419,7 @@ static void persist_dtr(struct dm_target *ti)
 {
 	struct persist_c *pc = (struct persist_c *) ti->private;
 
-	mutex_lock(&instance_lock);
-	list_del(&pc->node);
-	if (!--instances)
-		rip_probes();
-	mutex_unlock(&instance_lock);
+	rip_probes(&pc->add_probe, &pc->del_probe);
 
 	if (!IS_ERR_OR_NULL(pc->blkdev)) blkdev_put(pc->blkdev, dm_table_get_mode(ti->table));
 	kfree(pc->match_path);
