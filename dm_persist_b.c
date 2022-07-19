@@ -114,11 +114,17 @@ struct add_data {
 	int old_flags;
 };
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,11,0)
+#define get_kretprobe(ri) (ri->rp)
+#else
+#define get_kretprobe(ri) (ri->rph->rp)
+#endif
+
 static int add_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct gendisk * disk = (void*)regs->ARG;
 	struct add_data * d = (void*)ri->data;
-	struct persist_c * pc = container_of(ri->rp, struct persist_c, add_probe);
+	struct persist_c * pc = container_of(get_kretprobe(ri), struct persist_c, add_probe);
 	struct kobject * parent;
 
 	d->disk = NULL;
@@ -158,7 +164,7 @@ static int add_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 static int add_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct persist_c * pc = container_of(ri->rp, struct persist_c, add_probe);
+	struct persist_c * pc = container_of(get_kretprobe(ri), struct persist_c, add_probe);
 	struct add_data * d = (void*)ri->data;
 
 	if (!d->disk) return 0;
@@ -179,7 +185,7 @@ static int del_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	dev_t del_dev;
 	struct gendisk * disk = (struct gendisk *)regs->ARG1;
-	struct persist_c * pc = container_of(ri->rp, struct persist_c, del_probe);
+	struct persist_c * pc = container_of(get_kretprobe(ri), struct persist_c, del_probe);
 
 	if (IS_ERR_OR_NULL(disk)) { pr_warn("Deleted disk is NULL\n"); return 0; }
 

@@ -120,6 +120,21 @@ module_param_cb(block_path, &path_ops, &blocklist, 0220);
 module_param_cb(block_path_once, &path_ops, &blocklist_once, 0220);
 module_param_cb(forget_path, &path_ops, NULL, 0220);
 
+static unsigned long timeout_jiffies = 0;
+static int set_timeout(const char * val, const struct kernel_param *kp)
+{
+    unsigned long timeout_j;
+    if (kstrtoul(val, 0, &timeout_j))
+        return -EBADMSG;
+    timeout_j *= HZ; 
+    timeout_j += jiffies;
+    if (timeout_j > timeout_jiffies) timeout_jiffies = timeout_j;
+    return 0;
+}
+
+struct kernel_param_ops timeout_ops = {0, set_timeout, NULL, NULL};
+module_param_cb(block_timout_s, &timeout_ops, NULL, 0220);
+
 struct instance_data {
     struct gendisk *disk;
 };
@@ -158,7 +173,7 @@ static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
     disk = (struct gendisk *)(regs->ARG);
 
     if (!enabled
-        || (!is_blocklisted(regs, disk) && !block_all && !block_once)
+        || (!is_blocklisted(regs, disk) && !block_all && !block_once && (jiffies > timeout_jiffies))
         || (block_once = 0, disk->flags & GENHD_FL_NO_PART_SCAN)) {
         data->disk = NULL;
     } else {
