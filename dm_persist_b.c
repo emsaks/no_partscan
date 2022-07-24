@@ -371,7 +371,11 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	pc->path_pattern = devpath;
 
 	md = dm_table_get_md(ti->table);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
 	dm_copy_name_and_uuid(md, pc->name, NULL);
+#else
+	strcpy(pc->name, dm_device_name(md));
+#endif
 
 	pc->jiffies_when_added = jiffies;
 	pc->capacity = get_capacity(pc->blkdev->bd_disk);
