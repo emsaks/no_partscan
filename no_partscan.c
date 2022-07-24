@@ -132,8 +132,19 @@ static int set_timeout(const char * val, const struct kernel_param *kp)
     return 0;
 }
 
-struct kernel_param_ops timeout_ops = {0, set_timeout, NULL, NULL};
-module_param_cb(block_timout_s, &timeout_ops, NULL, 0220);
+static int get_timeout(char *buffer, const struct kernel_param *kp)
+{
+    
+    unsigned long jiffies_now = jiffies;
+    unsigned long timeout_s = (jiffies_now < timeout_jiffies) ? 
+      (jiffies_now - timeout_jiffies) / HZ 
+    : 0;
+    sprintf(buffer, "%lu", timeout_s);
+    return 0;
+}
+
+struct kernel_param_ops timeout_ops = {0, set_timeout, get_timeout, NULL};
+module_param_cb(block_timeout_s, &timeout_ops, NULL, 0664);
 
 struct instance_data {
     struct gendisk *disk;
