@@ -1,5 +1,4 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
-//#include "dm.h"
 
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -7,27 +6,20 @@
 #include <linux/bio.h>
 #include <linux/genhd.h>
 #include <linux/blkdev.h>
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/blkdev.h>
-#include <linux/bio.h>
-#include <linux/dax.h>
 #include <linux/slab.h>
 #include <linux/device-mapper.h>
 #include <linux/raid/md_p.h>
 #include <linux/version.h>
-#include <linux/mutex.h>
-#include <linux/completion.h>
-#include <uapi/linux/kdev_t.h>
+
+void dm_internal_suspend_fast(struct mapped_device *md);
+void dm_internal_resume_fast(struct mapped_device *md);
+void dm_internal_suspend_noflush(struct mapped_device *md);
+void dm_internal_resume(struct mapped_device *md);
 
 #define PERSIST_VER "1"
-static char * holder = "dm_persist"PERSIST_VER" held disk.";
-
-#ifndef bdev_kobj
-	#define bdev_kobj(_bdev) (&(disk_to_dev((_bdev)->bd_disk)->kobj))
-#endif
-
 #define DM_MSG_PREFIX "persist"PERSIST_VER
+
+static char * holder = "dm_persist"PERSIST_VER" held disk.";
 
 /*
  * persist: maps a persistent range of a device.
@@ -38,32 +30,23 @@ static char * holder = "dm_persist"PERSIST_VER" held disk.";
 struct persist_opts {
 	char * script_on_added;
 	int disk_flags;
-	uint32_t io_timeout_jiffies;
-	uint32_t new_disk_addtl_jiffies;
+	uint32_t new_disk_timeout_jiffies;
 };
+
 struct persist_c {
-	struct kretprobe add_probe, del_probe;
+	struct dm_target *target;
 	char name[DM_NAME_LEN+1];
 
-	atomic_t 	next_dev;
-	dev_t 		this_dev;
-	struct completion disk_added;
+	struct kretprobe add_probe, del_probe;
 
 	struct block_device * blkdev;
-	sector_t start;
-	sector_t capacity;
+	sector_t start, capacity;
 
 	char *	path_pattern;
 	int 	addtl_depth;
 
-	atomic_t ios_in_flight;
-	struct completion ios_finished;
-	struct mutex io_lock;
-
-	int timed_out;
-
 	uint swapped_count;
-	unsigned long jiffies_when_added;
+	unsigned long jiffies_when_removed, jiffies_when_added;
 
 	struct persist_opts opts;
 };
@@ -83,20 +66,37 @@ static int test_path(struct kobject * kobj, const char * pattern, int rewind)
 	const char * part, * pp, * kp;
 
 	if (!kobj) return 1;
-	while (rewind--) if (!(kobj = kobj->parent)) return 1;
+	while (rewind--) if (!(kobj = kobj->parent)) { return 1; }
 
 	part = pattern + strlen(pattern); 
 	do {
 		part -= strlen(kobj->name) + 1;
 		if (part < pattern || *part != '/')
-			return 1;
+			{ return 1; }
 
 		for (kp = kobj->name, pp = part+1; *kp; ++kp, ++pp)
 			if ((*kp != *pp) && (*pp != '?'))
-				return 1;
+				{ return 1; }
 	} while ((kobj = kobj->parent));
 
 	return part != pattern;
+}
+
+int try_script(struct persist_c *pc) {
+	int ret;
+	char * envp[] = { "HOME=/", NULL };
+	char * argv[] = { "/bin/bash", pc->opts.script_on_added, pc->name, pc->blkdev->bd_disk->disk_name, NULL };
+
+	if (!pc->opts.script_on_added)
+		return 0;
+
+	pw("Calling user script %s\n", pc->opts.script_on_added);
+
+	ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
+	if (ret) 
+		pw("Script failed with error code %i\n", ret);
+
+	return ret;
 }
 
 #include "regs.h"
@@ -134,6 +134,7 @@ static int add_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 		return 0;
 	}
 
+// we must use parent because the block/sd* parts may not yet have been set
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(4,7,10)
     parent = &(disk->driverfs_dev->kobj);
 #else // driverfs_dev removed and device passed directly to the function
@@ -141,7 +142,7 @@ static int add_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 #endif
 
 	if (!parent) {
-		pr_warn("Disk [%s] has no parent device! Skipping\n", disk->disk_name);
+		pw("Disk [%s] has no parent device! Skipping\n", disk->disk_name);
 		return 0;
 	}
 
@@ -152,11 +153,12 @@ static int add_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	} else if (get_capacity(disk) != pc->capacity) {
 		pw("New disk [%s] capacity doesn't match! Skipping.\n", disk->disk_name);
 	} else {
+		pw("Matched new disk [%s]\n", disk->disk_name);
 		disk->flags |= pc->opts.disk_flags;
 		d->disk = disk;
 
 		if ((d->old_flags ^ disk->flags) & GENHD_FL_NO_PART_SCAN)
-			pr_warn("Suppressed partscan on disk %s\n", disk->disk_name);
+			pw("Suppressed partscan on disk %s\n", disk->disk_name);
 	}
 
 	return 0;
@@ -166,37 +168,60 @@ static int add_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct persist_c * pc = container_of(get_kretprobe(ri), struct persist_c, add_probe);
 	struct add_data * d = (void*)ri->data;
+	unsigned long downtime = jiffies - pc->jiffies_when_removed;
 
 	if (!d->disk) return 0;
+
+	// todo: restore flags?
 
 	if (regs_return_value(regs))
 		return 0;
 
-	pw("Flagging for new disk [%s]\n", d->disk->disk_name);
-	atomic_set(&pc->next_dev, disk_devt(d->disk));
-	complete(&pc->disk_added);
+	if (pc->blkdev) {
+		pw("New disk found before old one was deleted; Ignoring.\n");
+		return 0;
+	}
 
-	// todo: restore flags?
+	if (pc->jiffies_when_removed + pc->opts.new_disk_timeout_jiffies < jiffies) {
+		pw("Not loading new disk after timeout.\n");
+		return 0;
+	}
+
+	pc->jiffies_when_added = jiffies;
+	pc->blkdev = blkdev_get_by_dev(disk_devt(d->disk), dm_table_get_mode(pc->target->table), holder);
+	if (IS_ERR_OR_NULL(pc->blkdev)) {
+		pw("Failed to load new disk [%s]\n", d->disk->disk_name);
+		return 0;
+	}
+
+	try_script(pc);
+	dm_internal_resume_fast(dm_table_get_md(pc->target->table));
+
+	pw("Loaded new disk #%i [%s]; Downtime %lum%lus\n",
+				++pc->swapped_count,
+				d->disk->disk_name,
+				downtime / (HZ*60), (downtime % (HZ*60)) / HZ);
 
 	return 0;
 }
 
 static int del_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	dev_t del_dev;
 	struct gendisk * disk = (struct gendisk *)regs->ARG1;
 	struct persist_c * pc = container_of(get_kretprobe(ri), struct persist_c, del_probe);
+	unsigned long uptime = jiffies - pc->jiffies_when_added;
 
-	if (IS_ERR_OR_NULL(disk)) { pr_warn("Deleted disk is NULL\n"); return 0; }
+	if (IS_ERR_OR_NULL(pc->blkdev) || IS_ERR_OR_NULL(disk) || disk_devt(pc->blkdev->bd_disk) != disk_devt(disk))
+		return 0;
 
-	del_dev = disk_devt(disk);
+	pw("Removing disk [%s]; Uptime: %lum%lus\n",
+				pc->blkdev->bd_disk->disk_name,
+				uptime / (HZ*60), (uptime % (HZ*60)) / HZ);
 
-	if (atomic_cmpxchg(&pc->next_dev, del_dev, 0) == del_dev) {
-		pw("Cleared next_dev\n");
-	} else if (pc->this_dev == del_dev) {
-		pw("Clearing this_dev\n");
-		pc->this_dev = 0;
-	}
+	dm_internal_suspend_fast(dm_table_get_md(pc->target->table));
+	blkdev_put(pc->blkdev, dm_table_get_mode(pc->target->table));
+	pc->blkdev = NULL;
+	pc->jiffies_when_removed = jiffies;
 
 	return 0;
 }
@@ -248,22 +273,14 @@ static int parse_opts(struct dm_target *ti, struct persist_c * pc, int argc, cha
 	int i;
 
 	for (i = 0; i < argc; i++) {
-		if (!strcmp(argv[i], "io_timeout")) {
-			if (++i == argc) goto err;
-			if (sscanf(argv[i], "%u%c", &tmp, &dummy) != 1) {
-				ti->error = "Bad io timeout";
-				return -ENOPARAM;
-			}
-			pw("Setting io timeout to %i seconds\n", tmp);
-			opts->io_timeout_jiffies = tmp*HZ;
-		} else if(!strcmp(argv[i], "disk_timeout")) {
+		if(!strcmp(argv[i], "disk_timeout")) {
 			if (++i == argc) goto err;
 			if (sscanf(argv[i], "%u%c", &tmp, &dummy) != 1) {
 				ti->error = "Bad disk timeout";
 				return -ENOPARAM;
 			}
-			pw("Setting disk to %i seconds\n", tmp);
-			opts->new_disk_addtl_jiffies = tmp*HZ;
+			pw("Setting new disk timeout to %i seconds\n", tmp);
+			opts->new_disk_timeout_jiffies = tmp*HZ;
 		} else if (!strcmp(argv[i], "script")) {
 			if (++i == argc) goto err;
 			if (*argv[i] != '/') {
@@ -284,16 +301,20 @@ static int parse_opts(struct dm_target *ti, struct persist_c * pc, int argc, cha
 				opts->disk_flags |= GENHD_FL_NO_PART_SCAN;
 			else
 				opts->disk_flags &= ~GENHD_FL_NO_PART_SCAN;
+		} else if (!strcmp(argv[i], "offset")) {
+			unsigned long long tmp;
+			char dummy;
+			if (sscanf(argv[1], "%llu%c", &tmp, &dummy) != 1 || tmp != (sector_t)tmp) {
+				ti->error = "Invalid device sector";
+				return -EINVAL;
+			}
+			pc->start = tmp;
 		} else {
 			pw("Unknown parameter %s\n", argv[i]);
 			ti->error = "Unknown parameter";
 			return -ENOPARAM;
 		}
 	}
-
-	if (opts->new_disk_addtl_jiffies > opts->io_timeout_jiffies)
-		opts->new_disk_addtl_jiffies -= opts->io_timeout_jiffies;
-	else opts->new_disk_addtl_jiffies = 0;
 
 	return 0;
 err:
@@ -307,8 +328,6 @@ err:
 static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
 	struct persist_c *pc;
-	unsigned long long tmp;
-	char dummy;
 	int ret;
 	char * devpath;
 	char * pattern;
@@ -326,13 +345,7 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		return -ENOMEM;
 	}
 	memset(pc, 0, sizeof(*pc));
-
-	ret = -EINVAL;
-	if (sscanf(argv[1], "%llu%c", &tmp, &dummy) != 1 || tmp != (sector_t)tmp) {
-		ti->error = "Invalid device sector";
-		goto bad_instance;
-	}
-	pc->start = tmp;
+	pc->target = ti;
 
 	pc->blkdev = blkdev_get_by_path(argv[0], dm_table_get_mode(ti->table), holder);
 	if (IS_ERR(pc->blkdev)) {
@@ -358,9 +371,9 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	if (*pp || (*kp && *kp != '/')) { // this will exclude trailing '/' in pattern
-		pr_warn("Device is not on path: %s != %s\n", devpath, argv[1]);
+		pr_warn("Device is not on path: [%.*s]%s != %s\n", (int)(kp - devpath), devpath, kp, pp);
 		ti->error = "Device is not on provided path";
-		ret = -EBADMSG;
+		ret = -EINVAL;
 		goto bad_path;
 	}
 
@@ -379,19 +392,12 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	pc->jiffies_when_added = jiffies;
 	pc->capacity = get_capacity(pc->blkdev->bd_disk);
-	pc->this_dev = disk_devt(pc->blkdev->bd_disk);
 
 	pc->opts.disk_flags = GENHD_FL_NO_PART_SCAN;
-	pc->opts.io_timeout_jiffies = 30*HZ;
-	pc->opts.new_disk_addtl_jiffies = 60*HZ;
+	pc->opts.new_disk_timeout_jiffies = 90*HZ;
 
 	ret = parse_opts(ti, pc, argc - 3, &argv[3]);
 	if (ret) goto bad_path;
-	
-	init_completion(&pc->ios_finished);
-	init_completion(&pc->disk_added);
-	mutex_init(&pc->io_lock);
-	atomic_set(&pc->ios_in_flight, 0);
 
 	ret = plant_probes(&pc->add_probe, &pc->del_probe);
 	if (ret) {
@@ -399,7 +405,7 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad_path;
 	}
 
-	pr_warn("Finished init\n");
+	pw("Finished constructor\n");
 
 	ti->private = pc;
 	ti->num_flush_bios = 1;
@@ -438,128 +444,31 @@ static sector_t persist_map_sector(struct dm_target *ti, sector_t bi_sector)
 	return pc->start + dm_target_offset(ti, bi_sector);
 }
 
-int try_script(struct persist_c *pc) {
-	int ret;
-	char * envp[] = { "HOME=/", NULL };
-	char * argv[] = { "/bin/bash", pc->opts.script_on_added, pc->name, pc->blkdev->bd_disk->disk_name, NULL };
-
-	if (!pc->opts.script_on_added)
-		return 0;
-
-	pw("Calling user script %s\n", pc->opts.script_on_added);
-
-	ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
-	if (ret) 
-		pw("Script failed with error code %i\n", ret);
-
-	return ret;
-}
-
-static struct block_device * get_dev(struct dm_target *ti)
+static int persist_map(struct dm_target *ti, struct bio *bio)
 {
 	struct persist_c *pc = ti->private;
 
-	mutex_lock(&pc->io_lock); {
-		if (pc->timed_out) {
-			pw("Fast timeout\n");
-			mutex_unlock(&pc->io_lock);
-			return NULL;
-		}
-		if (!pc->this_dev) { // cleared by disk_del
-			unsigned long uptime = jiffies - pc->jiffies_when_added;
-			int io_jiffies = wait_for_completion_io_timeout(&pc->ios_finished, pc->opts.io_timeout_jiffies);
-
-			if (!atomic_read(&pc->ios_in_flight)) {
-				if (IS_ERR_OR_NULL(pc->blkdev)) { pw("Can't free NULL device!\n"); } else {
-					blkdev_put(pc->blkdev, dm_table_get_mode(ti->table));
-					pc->blkdev = NULL;
-				}
-			} else {
-				pw("Forgetting %u ios_in_flight\n", atomic_read(&pc->ios_in_flight));
-				atomic_set(&pc->ios_in_flight, 0);
-			}
-
-wait:		if (!wait_for_completion_timeout(&pc->disk_added, pc->opts.new_disk_addtl_jiffies + io_jiffies)) {
-				pw("Disk wait timeout\n");
-				pc->timed_out = 1;
-				mutex_unlock(&pc->io_lock);
-				return NULL;
-			}
-
-			do {
-				pc->this_dev = atomic_read(&pc->next_dev);
-			} while (atomic_cmpxchg(&pc->next_dev, pc->this_dev, 0) != pc->this_dev);
-
-			pc->blkdev = blkdev_get_by_dev(pc->this_dev, dm_table_get_mode(ti->table), holder);
-			pc->jiffies_when_added = jiffies;
-			if (IS_ERR(pc->blkdev)) {
-				pw("Failed to get new disk: %u with error %pe\n", pc->this_dev, pc->blkdev);
-				io_jiffies = pc->opts.io_timeout_jiffies;
-				goto wait;
-			}
-
-			// todo: do we need to check path again?
-
-			if (get_capacity(pc->blkdev->bd_disk) != pc->capacity) {
-				pw("New disk [%s] capacity doesn't match! Skipping.\n", pc->blkdev->bd_disk->disk_name);
-				blkdev_put(pc->blkdev, dm_table_get_mode(ti->table));
-				pc->blkdev = NULL;
-				io_jiffies = pc->opts.io_timeout_jiffies;
-				goto wait;
-			}
-
-			pc->swapped_count++;
-			pw("Added new disk [%s] (#%i); Previous uptime: %lum%lus\n",
-				pc->blkdev->bd_disk->disk_name,
-				pc->swapped_count, 
-				uptime / (HZ*60), (uptime % (HZ*60)) / HZ);
-
-			try_script(pc);
-		}
-		atomic_inc(&pc->ios_in_flight);
-	} mutex_unlock(&pc->io_lock);
-
-	return pc->blkdev;
-}
-
-static int persist_map(struct dm_target *ti, struct bio *bio)
-{
-	struct block_device * dev = get_dev(ti);
-	if (!dev) return DM_MAPIO_KILL;
-
-	bio_set_dev(bio, dev);
+	bio_set_dev(bio, pc->blkdev);
 	bio->bi_iter.bi_sector = persist_map_sector(ti, bio->bi_iter.bi_sector);
 
 	return DM_MAPIO_REMAPPED;
 }
 
-static int persist_endio(struct dm_target *ti, struct bio *bio, blk_status_t *error)
-{
-	struct persist_c *pc = ti->private;
-
-	if (atomic_dec_and_test(&pc->ios_in_flight))
-		complete(&pc->ios_finished);
-
-	return DM_ENDIO_DONE;
-}
-
-#ifndef DM_TARGET_PASSES_CRYPTO
-	#define DM_TARGET_PASSES_CRYPTO 0
-#endif
-#ifndef DM_TARGET_NOWAIT
-	#define DM_TARGET_NOWAIT 0
-#endif
-
 static struct target_type persist_target = {
 	.name   = "persist"PERSIST_VER,
 	.version = {1, 4, 0},
-	.features = DM_TARGET_PASSES_INTEGRITY | DM_TARGET_NOWAIT |
-		    DM_TARGET_ZONED_HM | DM_TARGET_PASSES_CRYPTO,
+	.features = DM_TARGET_PASSES_INTEGRITY 
+#ifdef DM_TARGET_NOWAIT
+		| DM_TARGET_NOWAIT
+#endif
+#ifdef DM_TARGET_PASSES_CRYPTO
+		| DM_TARGET_PASSES_CRYPTO
+#endif
+		| DM_TARGET_ZONED_HM,
 	.module = THIS_MODULE,
 	.ctr    = persist_ctr,
 	.dtr    = persist_dtr,
 	.map    = persist_map,
-	.end_io = persist_endio,
 };
 
 int __init dm_persist_init(void)
