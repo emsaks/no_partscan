@@ -183,7 +183,7 @@ static int add_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 		return 0;
 	}
 
-	if (pc->jiffies_when_removed + pc->opts.new_disk_timeout_jiffies < jiffies) {
+	if (pc->opts.new_disk_timeout_jiffies && (pc->jiffies_when_removed + pc->opts.new_disk_timeout_jiffies < jiffies)) {
 		pw("Not loading new disk after timeout.\n");
 		return 0;
 	}
@@ -467,8 +467,7 @@ static int persist_map(struct dm_target *ti, struct bio *bio)
 static int persist_message(struct dm_target *ti, unsigned argc, char **argv, char *result, unsigned maxlen)
 {
 	if (argc && !strcmp(argv[0], "resume")) {
-		dm_suspend(dm_table_get_md(ti->table), 0);
-		dm_internal_resume_fast(dm_table_get_md(ti->table));
+		dm_internal_resume(dm_table_get_md(ti->table));
 	}
 	return 0;
 }
@@ -484,10 +483,11 @@ static struct target_type persist_target = {
 		| DM_TARGET_PASSES_CRYPTO
 #endif
 		| DM_TARGET_ZONED_HM,
-	.module = THIS_MODULE,
-	.ctr    = persist_ctr,
-	.dtr    = persist_dtr,
-	.map    = persist_map,
+	.module  = THIS_MODULE,
+	.ctr     = persist_ctr,
+	.dtr     = persist_dtr,
+	.map     = persist_map,
+	.message = persist_message,
 };
 
 int __init dm_persist_init(void)
