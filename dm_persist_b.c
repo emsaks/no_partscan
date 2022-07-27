@@ -169,6 +169,7 @@ static int add_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	struct persist_c * pc = container_of(get_kretprobe(ri), struct persist_c, add_probe);
 	struct add_data * d = (void*)ri->data;
 	unsigned long downtime = jiffies - pc->jiffies_when_removed;
+	struct block_device * bd;
 
 	if (!d->disk) return 0;
 
@@ -188,14 +189,20 @@ static int add_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	}
 
 	pc->jiffies_when_added = jiffies;
-	pc->blkdev = blkdev_get_by_dev(disk_devt(d->disk), dm_table_get_mode(pc->target->table), holder);
-	if (IS_ERR_OR_NULL(pc->blkdev)) {
+	bd = blkdev_get_by_dev(disk_devt(d->disk), dm_table_get_mode(pc->target->table), holder);
+	if (IS_ERR_OR_NULL(bd)) {
 		pw("Failed to load new disk [%s]\n", d->disk->disk_name);
 		return 0;
 	}
 
+	if (cmpxchg(&pc->blkdev, NULL, bd)) {
+		pw("Lost race to replace block device with [%s]\n", d->disk->disk_name);
+		blkdev_put(bd, dm_table_get_mode(pc->target->table));
+		return 0;
+	}
+
 	try_script(pc);
-	dm_internal_resume_fast(dm_table_get_md(pc->target->table));
+	dm_internal_resume(dm_table_get_md(pc->target->table));
 
 	pw("Loaded new disk #%i [%s]; Downtime %lum%lus\n",
 				++pc->swapped_count,
@@ -210,6 +217,7 @@ static int del_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	struct gendisk * disk = (struct gendisk *)regs->ARG1;
 	struct persist_c * pc = container_of(get_kretprobe(ri), struct persist_c, del_probe);
 	unsigned long uptime = jiffies - pc->jiffies_when_added;
+	struct block_device * bd;
 
 	if (IS_ERR_OR_NULL(pc->blkdev) || IS_ERR_OR_NULL(disk) || disk_devt(pc->blkdev->bd_disk) != disk_devt(disk))
 		return 0;
@@ -218,9 +226,10 @@ static int del_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 				pc->blkdev->bd_disk->disk_name,
 				uptime / (HZ*60), (uptime % (HZ*60)) / HZ);
 
-	dm_internal_suspend_fast(dm_table_get_md(pc->target->table));
-	blkdev_put(pc->blkdev, dm_table_get_mode(pc->target->table));
+	dm_internal_suspend_noflush(dm_table_get_md(pc->target->table));
+	bd = pc->blkdev;
 	pc->blkdev = NULL;
+	blkdev_put(bd, dm_table_get_mode(pc->target->table));
 	pc->jiffies_when_removed = jiffies;
 
 	return 0;
@@ -304,7 +313,8 @@ static int parse_opts(struct dm_target *ti, struct persist_c * pc, int argc, cha
 		} else if (!strcmp(argv[i], "offset")) {
 			unsigned long long tmp;
 			char dummy;
-			if (sscanf(argv[1], "%llu%c", &tmp, &dummy) != 1 || tmp != (sector_t)tmp) {
+			if (++i == argc) goto err;
+			if (sscanf(argv[i], "%llu%c", &tmp, &dummy) != 1 || tmp != (sector_t)tmp) {
 				ti->error = "Invalid device sector";
 				return -EINVAL;
 			}
@@ -334,7 +344,7 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	char *kp, *pp, *kt;
 	struct mapped_device * md;
 
-	if (argc < 3) {
+	if (argc < 2) {
 		ti->error = "Invalid argument count";
 		return -EINVAL;
 	}
@@ -361,12 +371,12 @@ static int persist_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	devpath = kobject_get_path(&(disk_to_dev(pc->blkdev->bd_disk)->parent->kobj), GFP_KERNEL);
-	pattern = normalize_path(argv[2]);
+	pattern = normalize_path(argv[1]);
 
 	for (kp = devpath, pp = pattern; *kp; ++kp, ++pp) {
 		if (*kp != *pp) {
 			if (*pp != '?' || *kp == '/') break;
-			*kp = '?';
+			*kp = '?'; // '?' is a wildcard
 		}
 	}
 
@@ -452,6 +462,15 @@ static int persist_map(struct dm_target *ti, struct bio *bio)
 	bio->bi_iter.bi_sector = persist_map_sector(ti, bio->bi_iter.bi_sector);
 
 	return DM_MAPIO_REMAPPED;
+}
+
+static int persist_message(struct dm_target *ti, unsigned argc, char **argv, char *result, unsigned maxlen)
+{
+	if (argc && !strcmp(argv[0], "resume")) {
+		dm_suspend(dm_table_get_md(ti->table), 0);
+		dm_internal_resume_fast(dm_table_get_md(ti->table));
+	}
+	return 0;
 }
 
 static struct target_type persist_target = {
