@@ -134,13 +134,11 @@ static int set_timeout(const char * val, const struct kernel_param *kp)
 
 static int get_timeout(char *buffer, const struct kernel_param *kp)
 {
-    
     unsigned long jiffies_now = jiffies;
     unsigned long timeout_s = (jiffies_now < timeout_jiffies) ? 
-      (jiffies_now - timeout_jiffies) / HZ 
+      (timeout_jiffies - jiffies_now) / HZ 
     : 0;
-    sprintf(buffer, "%lu", timeout_s);
-    return 0;
+    return scnprintf(buffer, PAGE_SIZE, "%lu", timeout_s);
 }
 
 struct kernel_param_ops timeout_ops = {0, set_timeout, get_timeout, NULL};
