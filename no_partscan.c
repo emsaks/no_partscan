@@ -6,10 +6,6 @@
 #include <linux/genhd.h>
 #include <linux/slab.h>
 
-#include <scsi/scsi_host.h>
-#include <linux/usb.h>
-#include "/home/emsaks/WSL2-Linux-Kernel/drivers/usb/storage/usb.h"
-
 #include "regs.h"
 
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(4,7,10)
@@ -214,6 +210,11 @@ static struct kretprobe my_kretprobe = {
     .maxactive      = 20,
 };
 
+#include <scsi/scsi_host.h>
+
+/*
+#include <linux/usb.h>
+#include "/home/emsaks/WSL2-Linux-Kernel/drivers/usb/storage/usb.h"
 
 static int set_cancel_sg(const char * val, const struct kernel_param *kp)
 {
@@ -235,8 +236,45 @@ static int set_cancel_sg(const char * val, const struct kernel_param *kp)
     return 0;
 }
 
-struct kernel_param_ops cancel_sg_ops = {0, set_cancel_sg, NULL, NULL};
+struct kernel_param_ops cancel_sg_ops = {0, set_usb_stop, NULL, NULL};
 module_param_cb(cancel_sg, &cancel_sg_ops, NULL, 0664);
+*/
+
+typedef unsigned long (*usb_stor_stop_transport_t)(void * us);
+usb_stor_stop_transport_t usb_stor_stop_transport;
+
+static int set_usb_stop(const char * val, const struct kernel_param *kp)
+{
+    unsigned long hostnum;
+    struct Scsi_Host * host;
+
+    if (kstrtoul(val, 0, &hostnum))
+        return -EBADMSG;
+
+    host = scsi_host_lookup(hostnum);
+    if (IS_ERR_OR_NULL(host))
+        return -ENODEV;
+    
+    // todo: ensure is usb?
+    usb_stor_stop_transport(host->hostdata);
+    scsi_host_put(host);
+    return 0;
+}
+
+struct kernel_param_ops usb_stop_ops = {0, set_usb_stop, NULL, NULL};
+module_param_cb(cancel_sg, &usb_stop_ops, NULL, 0664);
+
+
+
+int init_usb()
+{
+    static struct kprobe kp = {
+        .symbol_name = "usb_stor_stop_transport"
+    };
+    register_kprobe(&kp);
+    usb_stor_stop_transport = (usb_stor_stop_transport_t) kp.addr;
+    unregister_kprobe(&kp);
+}
 
 static int __init kretprobe_init(void)
 {
@@ -248,6 +286,9 @@ static int __init kretprobe_init(void)
         pr_warn("register_kretprobe failed, returned %d\n", ret);
         return ret;
     }
+
+    init_usb();
+
     return 0;
 }
 
