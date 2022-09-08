@@ -458,6 +458,8 @@ static int persist_map(struct dm_target *ti, struct bio *bio)
 {
 	struct persist_c *pc = ti->private;
 
+	if (IS_ERR_OR_NULL(pc->blkdev))
+		return DM_MAPIO_DELAY_REQUEUE;
 	bio_set_dev(bio, pc->blkdev);
 	bio->bi_iter.bi_sector = persist_map_sector(ti, bio->bi_iter.bi_sector);
 
@@ -467,7 +469,7 @@ static int persist_map(struct dm_target *ti, struct bio *bio)
 static int persist_message(struct dm_target *ti, unsigned argc, char **argv, char *result, unsigned maxlen)
 {
 	if (argc && !strcmp(argv[0], "resume")) {
-		dm_internal_resume(dm_table_get_md(ti->table));
+		// dm_internal_resume(dm_table_get_md(ti->table));
 	}
 	return 0;
 }
