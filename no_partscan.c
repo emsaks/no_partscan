@@ -6,6 +6,10 @@
 #include <linux/genhd.h>
 #include <linux/slab.h>
 
+#include <scsi/scsi_host.h>
+#include <linux/usb.h>
+#include "/home/emsaks/WSL2-Linux-Kernel/drivers/usb/storage/usb.h"
+
 #include "regs.h"
 
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(4,7,10)
@@ -209,6 +213,30 @@ static struct kretprobe my_kretprobe = {
     .data_size      = sizeof(struct instance_data),
     .maxactive      = 20,
 };
+
+
+static int set_cancel_sg(const char * val, const struct kernel_param *kp)
+{
+    unsigned long hostnum;
+    struct Scsi_Host * host;
+    struct us_data *us;
+    if (kstrtoul(val, 0, &hostnum))
+        return -EBADMSG;
+
+    host = scsi_host_lookup(hostnum);
+    if (IS_ERR_OR_NULL(host))
+        return -ENODEV;
+    
+    us = host_to_us(host);
+    // todo: ensure is usb!
+
+    usb_sg_cancel(&us->current_sg);
+    scsi_host_put(host);
+    return 0;
+}
+
+struct kernel_param_ops cancel_sg_ops = {0, set_cancel_sg, NULL, NULL};
+module_param_cb(cancel_sg, &cancel_sg_ops, NULL, 0664);
 
 static int __init kretprobe_init(void)
 {
