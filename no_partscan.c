@@ -241,7 +241,7 @@ module_param_cb(cancel_sg, &cancel_sg_ops, NULL, 0664);
 */
 
 typedef unsigned long (*usb_stor_stop_transport_t)(void * us);
-usb_stor_stop_transport_t usb_stor_stop_transport;
+usb_stor_stop_transport_t usb_stor_stop_transport_p;
 
 static int set_usb_stop(const char * val, const struct kernel_param *kp)
 {
@@ -256,23 +256,28 @@ static int set_usb_stop(const char * val, const struct kernel_param *kp)
         return -ENODEV;
     
     // todo: ensure is usb?
-    usb_stor_stop_transport(host->hostdata);
+    usb_stor_stop_transport_p(host->hostdata);
     scsi_host_put(host);
     return 0;
 }
 
 struct kernel_param_ops usb_stop_ops = {0, set_usb_stop, NULL, NULL};
-module_param_cb(cancel_sg, &usb_stop_ops, NULL, 0664);
+module_param_cb(usb_stop, &usb_stop_ops, NULL, 0664);
 
-
-
-int init_usb()
+void init_usb(void)
 {
-    static struct kprobe kp = {
-        .symbol_name = "usb_stor_stop_transport"
-    };
-    register_kprobe(&kp);
-    usb_stor_stop_transport = (usb_stor_stop_transport_t) kp.addr;
+    int ret;
+    static struct kprobe kp;
+    memset(&kp, 0, sizeof(kp));
+    // = {
+        kp.symbol_name = "usb_stor_stop_transport";
+    //};
+    ret = register_kprobe(&kp);
+    if (ret < 0) {
+        pr_warn("register_kretprobe for usb failed, returned %d\n", ret);
+        return;
+    }
+    usb_stor_stop_transport_p = (usb_stor_stop_transport_t) kp.addr;
     unregister_kprobe(&kp);
 }
 

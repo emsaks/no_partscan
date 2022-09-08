@@ -2,8 +2,8 @@ VER := 1
 #obj-m := no_partscan.o # badbio.o  biosnoop.o 
 obj-m := dm_persist_b.o no_partscan.o # badbio.o  biosnoop.o 
 dm_persist$(VER)-objs := dm_persist.o
-#KDIR := /lib/modules/$(shell uname -r)/build
-KDIR := /home/emsaks/WSL2-Linux-Kernel
+KDIR := /lib/modules/$(shell uname -r)/build
+#KDIR := /home/emsaks/WSL2-Linux-Kernel
 PWD := $(shell pwd)
 
 
